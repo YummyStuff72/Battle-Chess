@@ -1,0 +1,3375 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Battle Chess: Combat Arena Patch I 2.4</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; }
+        body {
+            background-color: #0f172a;
+            color: #f8fafc;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            overflow: hidden;
+        }
+        #game-container {
+            position: relative;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+            border-radius: 8px;
+            overflow: hidden;
+            border: 2px solid #334155;
+        }
+        canvas { display: block; background: #1e293b; cursor: pointer; }
+        #controls-info {
+            margin-top: 10px;
+            display: flex;
+            gap: 30px;
+            background: #1e293b;
+            padding: 8px 20px;
+            border-radius: 8px;
+            border: 1px solid #334155;
+            font-size: 0.85rem;
+        }
+        .p1-color { color: #38bdf8; font-weight: bold; }
+        .p2-color { color: #f43f5e; font-weight: bold; }
+    </style>
+</head>
+<body>
+
+    <div id="game-container">
+        <canvas id="canvas" width="800" height="600"></canvas>
+    </div>
+
+    <div id="controls-info">
+        <div><span class="p1-color" id="p1-hud-info">P1 Controls:</span> W (Jump), A (Left), D (Right) | <b>S (Attack)</b></div>
+        <div><span class="p2-color" id="p2-hud-info">P2 / Bot:</span> Up (Jump), Left (Left), Right (Right) | <b>Down (Attack)</b></div>
+    </div>
+
+<script>
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+
+const STATE_MENU = 'MENU';
+const STATE_SETUP = 'SETUP';
+const STATE_CUSTOM_SETUP = 'CUSTOM_SETUP';
+const STATE_CHESS = 'CHESS';
+const STATE_ARENA = 'ARENA';
+const STATE_VICTORY = 'VICTORY';
+const STATE_LOG = 'LOG';
+const STATE_STATS = 'STATS';
+const STATE_SETTINGS = 'SETTINGS';
+const STATE_SHOP = 'SHOP';
+let gameState = STATE_MENU;
+
+let vsBot = false;
+const BOT_DIFFICULTIES = ['EASY', 'MEDIUM', 'HARD', 'AI OVERLORD'];
+let botDifficultyIdx = 1;
+let botChessTimer = 0;
+let yummySecretActive = false;
+
+// Audio Mute Toggle
+let soundMuted = localStorage.getItem('bc_muted') === 'true';
+
+// Key Bindings setup
+let p1Keys = { jump: 'KeyW', left: 'KeyA', right: 'KeyD', attack: 'KeyS' };
+let p2Keys = { jump: 'ArrowUp', left: 'ArrowLeft', right: 'ArrowRight', attack: 'ArrowDown' };
+
+try {
+    const savedP1K = localStorage.getItem('bc_p1_keys');
+    if (savedP1K) p1Keys = JSON.parse(savedP1K);
+    const savedP2K = localStorage.getItem('bc_p2_keys');
+    if (savedP2K) p2Keys = JSON.parse(savedP2K);
+} catch(e) {}
+
+let rebindingKey = null;
+
+function saveKeyBinds() {
+    try {
+        localStorage.setItem('bc_p1_keys', JSON.stringify(p1Keys));
+        localStorage.setItem('bc_p2_keys', JSON.stringify(p2Keys));
+    } catch(e) {}
+    updateHUDInfo();
+    unlockAchievement('keybind_king');
+}
+
+function formatKeyName(code) {
+    if (!code) return '?';
+    if (code.startsWith('Key')) return code.substring(3);
+    if (code.startsWith('Arrow')) return code.substring(5).toUpperCase();
+    if (code === 'Space') return 'SPACE';
+    return code;
+}
+
+function updateHUDInfo() {
+    const p1Info = document.getElementById('p1-hud-info');
+    const p2Info = document.getElementById('p2-hud-info');
+    if (p1Info) {
+        p1Info.parentNode.innerHTML = `<span class="p1-color">P1 Controls:</span> ${formatKeyName(p1Keys.jump)} (Jump), ${formatKeyName(p1Keys.left)} (Left), ${formatKeyName(p1Keys.right)} (Right) | <b>${formatKeyName(p1Keys.attack)} (Attack)</b>`;
+    }
+    if (p2Info) {
+        p2Info.parentNode.innerHTML = `<span class="p2-color">P2 / Bot:</span> ${formatKeyName(p2Keys.jump)} (Jump), ${formatKeyName(p2Keys.left)} (Left), ${formatKeyName(p2Keys.right)} (Right) | <b>${formatKeyName(p2Keys.attack)} (Attack)</b>`;
+    }
+}
+
+// Side & Names Setup
+let p1Side = 'w';
+let p1Name = "Player 1";
+let p2Name = "Player 2";
+
+// Unlocks, Shop & Persistent Stats
+let unlockedCustomW = localStorage.getItem('bc_custom_w') === 'true';
+let unlockedCustomB = localStorage.getItem('bc_custom_b') === 'true';
+
+let stats = {
+    wins: 0,
+    losses: 0,
+    jumps: 0,
+    shots: 0,
+    distance_traveled: 0,
+    damage_given: 0,
+    damage_taken: 0,
+    pieces_taken: 0,
+    pieces_lost: 0,
+    play_time: 0, // In seconds
+    golden_rooks: 1500, // Starting bonus currency
+    total_earned_rooks: 1500,
+    bot_wins: { 'EASY': 0, 'MEDIUM': 0, 'HARD': 0, 'AI OVERLORD': 0 },
+    bot_losses: { 'EASY': 0, 'MEDIUM': 0, 'HARD': 0, 'AI OVERLORD': 0 },
+    sets_won_med: {},
+    soundwave_beat_sets: {}
+};
+
+let shopData = {
+    unlockedSets: { 'crit': true, 'custom': true },
+    cosmeticsOwned: {},
+    cosmeticsEnabled: {},
+    sneezesCount: 3
+};
+
+try {
+    const savedStats = localStorage.getItem('bc_stats');
+    if (savedStats) stats = { ...stats, ...JSON.parse(savedStats) };
+    const savedShop = localStorage.getItem('bc_shop');
+    if (savedShop) shopData = { ...shopData, ...JSON.parse(savedShop) };
+} catch(e) {}
+
+function saveStats() {
+    try {
+        localStorage.setItem('bc_stats', JSON.stringify(stats));
+        localStorage.setItem('bc_shop', JSON.stringify(shopData));
+    } catch(e) {}
+    checkStatAchievements();
+}
+
+// Track Play Time
+setInterval(() => {
+    stats.play_time++;
+    saveStats();
+}, 1000);
+
+let achievements = {};
+try {
+    const savedAch = localStorage.getItem('bc_achievements');
+    if (savedAch) achievements = JSON.parse(savedAch);
+} catch(e) {}
+
+const ACHIEVEMENT_LIST = [
+    { id: 'am_i_good', name: "Am I good?", desc: "Open stats and achievements", secret: true },
+    { id: 'not_yet', name: "Not yet", desc: "Press WASD or arrow keys in the main menu", secret: false },
+    { id: 'version_protester', name: "Version protester", desc: "In the Update log, click any version lower than 2.0", secret: true },
+    { id: 'update_log_open', name: "What did I miss?", desc: "Open the update log", secret: true },
+    { id: 'fire_secret', name: "We Didn't Start The Fire", desc: "Unlock by getting the Pyro secret (click 'yummystuff interactive')", secret: true },
+    { id: 'personality', name: "Personality", desc: "Change your name", secret: false },
+    { id: 'getting_started', name: "Getting started", desc: "Move a piece", secret: false },
+    { id: 'promotion', name: "Promotion!", desc: "Promote a pawn", secret: false },
+    { id: 'castling', name: "Castling", desc: "Castle your king", secret: false },
+    { id: 'en_passant', name: "En Passant", desc: "Capture a pawn en passant", secret: false },
+    { id: 'the_future', name: "The future", desc: "Lose to a bot", secret: false },
+    { id: 'friendship_destroyer', name: "Friendship destroyer", desc: "Beat player 2", secret: false },
+    { id: 'new_commander', name: "New commander", desc: "Play 1 match", secret: false },
+    { id: 'crit_35', name: "35%", desc: "Get a critical hit on an enemy piece", secret: false },
+    { id: 'spammer', name: "Spammer", desc: "Shoot over 300 bullets in a single match", secret: false },
+    { id: 'arsonist', name: "Arsonist", desc: "Win a match with the pyro set", secret: false },
+    { id: 'dracula', name: "Dracula", desc: "Win a match with vamp set", secret: false },
+    { id: 'lucky', name: "Lucky", desc: "Win with the crit set", secret: false },
+    { id: 'snowman', name: "Snowman", desc: "Win using frost set", secret: false },
+    { id: 'avatar', name: "Avatar the seccond to last Air bender", desc: "win using the Air set", secret: false },
+    { id: 'director', name: "Director", desc: "Win with the Soundwave set", secret: false },
+    { id: 'out_of_time', name: "Out of time", desc: "Get hit with the Vibrate effect", secret: false },
+    { id: 'jack_of_all_trades', name: "Jack of all trades", desc: "Win with every set (Medium+ Bot)", secret: false },
+    { id: 'happy_michael', name: "Happy Michael", desc: "Beat every set using Soundwave set", secret: false },
+    { id: 'lost_tempo', name: "Lost tempo", desc: "Move the same piece twice in a row", secret: false },
+    { id: 'good_tempo', name: "Good tempo", desc: "Don't move a piece twice in first 10 moves", secret: false },
+    { id: 'twist_x', name: "Twist-X", desc: "Blow the enemy away", secret: false },
+    { id: 'reunite_band', name: "Reunite the band", desc: "?where's Earth?", secret: true },
+    { id: 'reed_timer', name: "Reed Timer", desc: "?Send the Dom1?", secret: true },
+    { id: 'volleyball', name: "Volley ball", desc: "?set!Spike!?", secret: true },
+    { id: 'sad_michael', name: "Sad Michael", desc: "?No rooks?", secret: true },
+    { id: 'ice_cube', name: "IceCube 7.2", desc: "Freeze an enemy", secret: false },
+    { id: 'eli_ethan', name: "Eli+Ethan Kight", desc: "Win moving the knights", secret: false },
+    { id: 'total_war', name: "Total war", desc: "?burn it all down?", secret: true },
+    { id: 'scholars_mate', name: "Scholar's Mate", desc: "Win in under 4 moves", secret: false },
+    { id: 'wait_thats_how', name: "Wait that's how you win", desc: "?Tick Tock?", secret: true },
+    { id: 'surgeon', name: "Surgeon", desc: "Win only killing the king", secret: false },
+    { id: 'memory_loss', name: "Memory loss", desc: "?did I move that yet?", secret: true },
+    { id: 'hikaru', name: "Hikaru Nakamura", desc: "Get 50% of achievements", secret: false },
+    { id: 'stat_72', name: "72", desc: "?The better 67?", secret: true },
+    { id: 'owner_plays', name: "Owner plays", desc: "?He plays his own game?", secret: true },
+    { id: 'long_thinker', name: "Long thinker", desc: "Take over 59s to make a move", secret: true },
+    { id: 'gambler', name: "Gambler", desc: "Win with the chaos set", secret: false },
+    { id: 'frankenstein', name: "Frankenstine", desc: "Win using the custom set", secret: true },
+    { id: 'pogo_stick', name: "Pogo stick", desc: "Jump 250 times", secret: false },
+    { id: 'caffeinated', name: "Caffeinated", desc: "Jump 150 times, and run 10,000 pixels", secret: true },
+    { id: 'kill_streak', name: "Kill streak", desc: "Take 5 pieces in a row without losing a piece", secret: false },
+    { id: 'sacrifice_rook', name: "SACRIFICE THE ROOK", desc: "Lose the rook then win the next turn", secret: true },
+    { id: 'queen_sac', name: "Queen Sac", desc: "Unlock by losing your queen to a pawn", secret: true },
+    { id: 'mr_ed', name: "MR.Ed!", desc: "Unlock by getting the secret knights in chaos set", secret: true },
+    { id: 'goat', name: "GOAT", desc: "Kill the king with a pawn", secret: false },
+    { id: 'lone_soldier', name: "Lone solider", desc: "Lose every piece but the king", secret: false },
+    { id: 'perfectionist', name: "Perfectionist", desc: "Win a match without losing a single piece", secret: false },
+    { id: 'bullet_proof', name: "Bullet proof", desc: "Take 2,500 damage", secret: false },
+    { id: 'gun_man', name: "Gun man", desc: "Shoot 5,000 bullets", secret: false },
+    { id: 'no_mercy', name: "No mercy", desc: "Give 10,000 damage", secret: false },
+    { id: 'track_star', name: "Track Star", desc: "Run 50,000 pixels", secret: false },
+    { id: 'skill_issue', name: "Skill issue", desc: "Lose to each bot", secret: false },
+    { id: 'bot_battler', name: "Bot battler", desc: "Beat every bot difficulty", secret: false },
+    { id: 'chess_master', name: "Chess Master", desc: "Win 5 times against each chess difficulty", secret: false },
+    { id: 'magnus', name: "Magnus Carlson", desc: "Get every achievement", secret: false },
+    
+    // NEW v2.4 ACHIEVEMENTS
+    { id: 'tycoon', name: "Tycoon", desc: "Earn 10,000$", secret: false },
+    { id: 'flex', name: "Flex", desc: "Buy a chess board", secret: false },
+    { id: 'shopper_browsing', name: "Shopper?Just browsing?", desc: "Go to the shop", secret: false },
+    { id: 'plague', name: "Plague", desc: "Sneeze 5 times in a match", secret: false },
+    { id: 'impulsive', name: "Impulsive", desc: "?I need it all?", secret: true },
+    { id: 'golden_board_ach', name: "Golden", desc: "?Ohhhhh shiny?", secret: true },
+    { id: 'devoted', name: "Devoted", desc: "Play 5+ hours", secret: false },
+    { id: 'playtime_king', name: "Playtime king", desc: "Play 7.2+ hours", secret: false },
+    { id: 'just_started', name: "Just started", desc: "Play 1 hour+", secret: false },
+    { id: 'amazon', name: "Amazon", desc: "?I just need one thing?", secret: true },
+    { id: 'shopping_list', name: "Shopping list", desc: "Buy one thing from the shop", secret: false },
+    { id: 'manthey', name: "Manthey", desc: "Make 8 moves before a battle", secret: false },
+    { id: 'dead_eli', name: "Dead Eli", desc: "?The sad trumpet sounds, then revenge?", secret: true },
+    { id: 'mr_dunn', name: "Mr.Dunn", desc: "Win 50 chess matches", secret: false },
+    { id: 'matrix', name: "Matrix", desc: "Win a match without getting hit once", secret: false },
+    { id: 'thief', name: "Thief", desc: "Take 300 pieces", secret: false },
+    { id: 'santa_claus', name: "Santa Claus", desc: "?Giving chess pieces for Christmas?", secret: true },
+    { id: 'logan', name: "Logan", desc: "?I hate achievements?", secret: true },
+    { id: 'fancy_ach', name: "Fancy", desc: "?Become fancy?", secret: true },
+    { id: 'keybind_king', name: "Keybind king", desc: "Change a keybinding", secret: false }
+];
+
+let achievementPopup = null;
+let centerPopup = null;
+let achievementsScrollY = 0;
+let logScrollY = 0;
+let matchShotsP1 = 0;
+let matchP1PiecesLost = 0;
+let matchKillStreak = 0;
+let p1RookLostLastTurn = false;
+let p1KnightLostLastTurn = false;
+let sneezesInMatch = 0;
+let matchAchievementsEarned = 0;
+let itemsBoughtThisVisit = 0;
+
+// Trackers
+let totalChessMoves = 0;
+let p1MoveCount = 0;
+let p1MovedOnlyKnights = true;
+let p1MoveHistory = {};
+let p1TurnStartTime = 0;
+let lastMovedPieceCoord = null;
+let movedPieceCoordsSet = new Set();
+let p1RepeatedInFirst10 = false;
+let matchP1PiecesTaken = 0;
+let movesBeforeFirstBattle = 0;
+let firstBattleHappened = false;
+
+// Move undo state stack for Sneeze consumable
+let boardHistoryStack = [];
+
+// Standard chess mechanics added in Patch I 2.4
+let castlingRights = { wK: true, wQ: true, bK: true, bQ: true };
+let lastChessMove = null;
+let pendingPromotion = null;
+
+function addCurrency(amount) {
+    stats.golden_rooks += amount;
+    stats.total_earned_rooks += amount;
+    saveStats();
+    if (stats.total_earned_rooks >= 10000) unlockAchievement('tycoon');
+}
+
+function unlockAchievement(id) {
+    if (!achievements[id]) {
+        achievements[id] = true;
+        matchAchievementsEarned++;
+        try {
+            localStorage.setItem('bc_achievements', JSON.stringify(achievements));
+        } catch(e) {}
+        const ach = ACHIEVEMENT_LIST.find(a => a.id === id);
+        if (ach) triggerAchievementPopup(ach.name, ach.secret ? ach.name : ach.desc);
+        checkHikaruNakamura();
+        checkMagnusCarlson();
+    }
+}
+
+function checkHikaruNakamura() {
+    if (achievements['hikaru']) return;
+    const unlockedCount = Object.keys(achievements).filter(k => achievements[k]).length;
+    if (unlockedCount >= Math.ceil(ACHIEVEMENT_LIST.length / 2)) {
+        unlockAchievement('hikaru');
+    }
+}
+
+function checkStatAchievements() {
+    if (stats.jumps >= 250) unlockAchievement('pogo_stick');
+    if (stats.jumps >= 150 && stats.distance_traveled >= 10000) unlockAchievement('caffeinated');
+    if (stats.damage_taken >= 2500) unlockAchievement('bullet_proof');
+    if (stats.shots >= 5000) unlockAchievement('gun_man');
+    if (stats.damage_given >= 10000) unlockAchievement('no_mercy');
+    if (stats.distance_traveled >= 50000) unlockAchievement('track_star');
+    if (stats.wins >= 50) unlockAchievement('mr_dunn');
+    if (stats.pieces_taken >= 300) unlockAchievement('thief');
+    if (stats.pieces_lost >= 100) unlockAchievement('santa_claus');
+
+    // Playtime achievements
+    if (stats.play_time >= 3600) unlockAchievement('just_started');
+    if (stats.play_time >= 18000) unlockAchievement('devoted');
+    if (stats.play_time >= 25920) unlockAchievement('playtime_king');
+
+    if (stats.jumps >= 72 &&
+        stats.shots >= 72 &&
+        stats.distance_traveled >= 72 &&
+        stats.damage_given >= 72 &&
+        stats.damage_taken >= 72 &&
+        stats.pieces_taken >= 72 &&
+        stats.pieces_lost >= 72) {
+        unlockAchievement('stat_72');
+    }
+}
+
+function checkImpulsive() {
+    const allSetsUnlocked = ['air', 'frost', 'soundwave', 'pyro', 'vampire', 'random'].every(s => shopData.unlockedSets[s]);
+    const allCosmeticsOwned = ['eyeballs', 'coolshadez', 'goldenboard', 'diamondboard', 'fancy'].every(c => shopData.cosmeticsOwned[c]);
+    if (allSetsUnlocked && allCosmeticsOwned) {
+        unlockAchievement('impulsive');
+    }
+}
+
+function checkMagnusCarlson() {
+    if (achievements['magnus']) return;
+    const nonMagnus = ACHIEVEMENT_LIST.filter(a => a.id !== 'magnus');
+    if (nonMagnus.every(a => achievements[a.id])) {
+        unlockAchievement('magnus');
+    }
+}
+
+function triggerAchievementPopup(title, desc) {
+    achievementPopup = { title, desc, timer: 180 };
+    playTechnoFanfare();
+}
+
+// Custom Set Configurations
+let p1CustomGrid = Array(8).fill(null).map(() => Array(8).fill('crit'));
+let p2CustomGrid = Array(8).fill(null).map(() => Array(8).fill('crit'));
+let activeEditingPlayer = 1;
+
+// Audio Synthesizer
+let audioCtx = null;
+function initAudio() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+}
+
+function playRetroSound(freq, type, duration, sweepFreq = 0) {
+    if (soundMuted || !audioCtx) return;
+    try {
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = type;
+        osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+        if (sweepFreq !== 0) {
+            osc.frequency.exponentialRampToValueAtTime(Math.max(10, sweepFreq), audioCtx.currentTime + duration);
+        }
+        gain.gain.setValueAtTime(0.15, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start();
+        osc.stop(audioCtx.currentTime + duration);
+    } catch(e) {}
+}
+
+function playAxelFMelody() {
+    if (soundMuted) return;
+    initAudio();
+    const notes = [
+        { f: 311.13, d: 0.15, t: 0 },
+        { f: 370.00, d: 0.15, t: 0.18 },
+        { f: 311.13, d: 0.12, t: 0.36 },
+        { f: 311.13, d: 0.10, t: 0.52 },
+        { f: 415.30, d: 0.15, t: 0.66 },
+        { f: 311.13, d: 0.15, t: 0.84 },
+        { f: 277.18, d: 0.18, t: 1.02 }
+    ];
+    notes.forEach(n => {
+        setTimeout(() => playRetroSound(n.f, 'sawtooth', n.d), n.t * 1000);
+    });
+}
+
+function playTechnoFanfare() {
+    if (soundMuted) return;
+    initAudio();
+    if (!audioCtx) return;
+    const now = audioCtx.currentTime;
+    const notes = [
+        { f: 261.63, t: 0, d: 0.15 },
+        { f: 329.63, t: 0.15, d: 0.15 },
+        { f: 392.00, t: 0.30, d: 0.15 },
+        { f: 523.25, t: 0.45, d: 0.25 },
+        { f: 392.00, t: 0.70, d: 0.15 },
+        { f: 523.25, t: 0.85, d: 0.35 },
+        { f: 587.33, t: 1.20, d: 0.15 },
+        { f: 659.25, t: 1.35, d: 0.15 },
+        { f: 783.99, t: 1.50, d: 0.25 },
+        { f: 659.25, t: 1.75, d: 0.15 },
+        { f: 783.99, t: 1.90, d: 0.35 },
+        { f: 1046.50, t: 2.25, d: 0.65 }
+    ];
+    notes.forEach(n => {
+        try {
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            osc.type = 'sawtooth';
+            osc.frequency.setValueAtTime(n.f, now + n.t);
+            gain.gain.setValueAtTime(0.18, now + n.t);
+            gain.gain.exponentialRampToValueAtTime(0.001, now + n.t + n.d);
+            osc.connect(gain);
+            gain.connect(audioCtx.destination);
+            osc.start(now + n.t);
+            osc.stop(now + n.t + n.d);
+        } catch(e){}
+    });
+}
+
+function playShootSFX() { playRetroSound(440, 'square', 0.1, 110); }
+function playJumpSFX() { playRetroSound(150, 'square', 0.15, 450); }
+function playHitSFX() { playRetroSound(120, 'sawtooth', 0.12, 30); }
+
+const PIECE_SYMBOLS = {
+    'w_p': '♙', 'w_r': '♖', 'w_n': '♘', 'w_b': '♗', 'w_q': '♕', 'w_k': '♔',
+    'b_p': '♙', 'b_r': '♖', 'b_n': '♘', 'b_b': '♗', 'b_q': '♕', 'b_k': '♔'
+};
+
+const CHESS_SETS = {
+    crit: {
+        name: 'Crit Set',
+        price: 0,
+        desc: 'High-impact arsenal. 25% chance to land a +15 critical hit on every shot.',
+        weapons: {
+            'p': { name: 'Pistol', cooldown: 22, speed: 11, dmg: 20, count: 1, spread: 0, size: 4, color: '#facc15', critChance: 0.25, critDmg: 15 },
+            'n': { name: 'Shotgun', cooldown: 45, speed: 10, dmg: 15, count: 4, spread: 0.22, size: 3, color: '#fb923c', critChance: 0.25, critDmg: 15 },
+            'b': { name: 'Sniper Rifle', cooldown: 55, speed: 24, dmg: 60, count: 1, spread: 0, size: 5, color: '#38bdf8', critChance: 0.25, critDmg: 15 },
+            'r': { name: 'Machine Gun', cooldown: 6, speed: 13, dmg: 8, count: 1, spread: 0.08, size: 3, color: '#f43f5e', critChance: 0.25, critDmg: 15 },
+            'q': { name: 'Plasma Cannon', cooldown: 10, speed: 15, dmg: 17, count: 1, spread: 0.02, size: 6, color: '#a855f7', critChance: 0.25, critDmg: 15 },
+            'k': { name: 'Royal Cannon', cooldown: 40, speed: 14, dmg: 80, count: 1, spread: 0, size: 12, color: '#ef4444', critChance: 0.25, critDmg: 15 }
+        }
+    },
+    air: {
+        name: 'Air Set',
+        price: 750,
+        desc: 'Atmospheric arsenal. Hits inflict Wind Burst: bottom 1/3 launches up, top 1/3 slams down/pins, center 1/3 knocks back 140px.',
+        weapons: {
+            'p': { name: 'Wind Pistol', cooldown: 22, speed: 11, dmg: 20, count: 1, spread: 0, size: 4, color: '#e0f2fe', isAir: true },
+            'n': { name: 'Wave Tri-Burst', cooldown: 45, speed: 8, dmg: 12, count: 3, spread: 0.1, size: 4, color: '#bae6fd', isAir: true, isWave: true },
+            'b': { name: 'Air Sniper', cooldown: 55, speed: 5, dmg: 33.33, count: 1, spread: 0, size: 5, color: '#7dd3fc', isAir: true, homing: true },
+            'r': { name: 'Gale Minigun', cooldown: 6, speed: 13, dmg: 8, count: 1, spread: 0.5236, size: 3, color: '#38bdf8', isAir: true },
+            'q': { name: 'Omni Gale Burst', cooldown: 40, speed: 11, dmg: 15, count: 16, spread: 0, size: 4, color: '#0284c7', isAir: true, isOmni: true, hasAirShield: true },
+            'k': { name: 'Tornado Blast', cooldown: 75, speed: 3, dmg: 33.33, count: 1, spread: 0, size: 24, color: '#e0f2fe', isAir: true, isTornado: true }
+        }
+    },
+    frost: {
+        name: 'Frost Set',
+        price: 750,
+        desc: 'Chilling arsenal. Slows enemies by 15% (stacks up to 45%) for 3.5s, with a 7.5% freeze chance per shot!',
+        weapons: {
+            'p': { name: 'Ice Pistol', cooldown: 22, speed: 11, dmg: 20, count: 1, spread: 0, size: 4, color: '#38bdf8', isFrost: true },
+            'n': { name: 'Frost Shotgun', cooldown: 45, speed: 10, dmg: 15, count: 4, spread: 0.22, size: 3, color: '#00dfff', isFrost: true },
+            'b': { name: 'Ice Rifle', cooldown: 55, speed: 24, dmg: 60, count: 1, spread: 0, size: 5, color: '#99ffff', isFrost: true },
+            'r': { name: 'Frost Cannon', cooldown: 6, speed: 13, dmg: 8, count: 1, spread: 0.08, size: 3, color: '#70d6ff', isFrost: true },
+            'q': { name: 'Glacial Ray', cooldown: 10, speed: 15, dmg: 17, count: 1, spread: 0.02, size: 6, color: '#a0c4ff', isFrost: true },
+            'k': { name: 'Royal Ice Blast', cooldown: 40, speed: 14, dmg: 80, count: 1, spread: 0, size: 12, color: '#00b4d8', isFrost: true }
+        }
+    },
+    soundwave: {
+        name: 'Soundwave Set',
+        price: 1000,
+        desc: 'Vibrational arsenal. Impact creates a 175px Sound Field (1.5s, 10 DPS). Max 8 fields active.',
+        weapons: {
+            'p': { name: 'Vibro Pistol', cooldown: 24, speed: 11, dmg: 18, count: 1, spread: 0, size: 5, color: '#d2b48c', isVibrate: true },
+            'n': { name: 'Sonic Shotgun', cooldown: 45, color: '#e6c280', isSoundwaveKnight: true },
+            'b': { name: 'Sine Wave Sniper', cooldown: 50, speed: 14, dmg: 35, count: 1, color: '#f5d089', isSineWave: true, isVibrate: true },
+            'r': { name: 'Vibro Burst Cannon', cooldown: 45, color: '#c5a059', isSoundwaveRook: true },
+            'q': { name: 'Sonic Queen Cannon', cooldown: 45, color: '#e0c080', isSoundwaveQueen: true },
+            'k': { name: 'Royal Resonance', cooldown: 50, color: '#dfb15b', isSoundwaveKing: true }
+        }
+    },
+    pyro: {
+        name: 'Pyro Set',
+        price: 1250,
+        desc: 'Ignite enemies with searing flame bursts, fire beams, and scorching inferno shields.',
+        weapons: {
+            'p': { name: 'Fireball', cooldown: 25, speed: 9, dmg: 15, count: 1, spread: 0, size: 6, color: '#f97316', status: { type: 'burn', dmg: 5, interval: 180 } },
+            'n': { name: 'Homing Tri-Fire', cooldown: 50, speed: 4, dmg: 5, count: 3, spread: 0.35, size: 5, color: '#ff4500', homing: true, status: { type: 'burn', dmg: 5, interval: 180 } },
+            'b': { name: 'Fast Cinder', cooldown: 40, speed: 26, dmg: 0, count: 1, spread: 0, size: 4, color: '#f59e0b', status: { type: 'burn', dmg: 20, interval: 120 } },
+            'r': { name: 'Super Fire Beam', cooldown: 100, type: 'beam', duration: 270, dmgRate: 20, size: 18, color: '#ef4444', status: { type: 'burn', dmg: 2, interval: 60 } },
+            'q': { name: 'Inferno Homing Burst', cooldown: 65, speed: 4, dmg: 5, count: 8, spread: 0.6, size: 5, color: '#dc2626', homing: true, status: { type: 'burn', dmg: 5, interval: 180 } },
+            'k': { name: 'Mega Fireball & Shield', cooldown: 75, speed: 2.5, dmg: 120, count: 1, spread: 0, size: 28, color: '#ff0000', hasShield: true }
+        }
+    },
+    vampire: {
+        name: 'Vampire Set',
+        price: 1250,
+        desc: 'Life-draining arsenal. Vampire Rook boosted (+10 dmg, +2 lifesteal). Siphons health on hit!',
+        weapons: {
+            'p': { name: 'Poison Arrow', cooldown: 22, speed: 10, dmg: 16, count: 1, spread: 0, size: 5, color: '#22c55e', lifesteal: 7 },
+            'n': { name: 'Venom Tri-Dart', cooldown: 45, speed: 5, dmg: 9, count: 3, spread: 0.3, size: 4, color: '#10b981', homing: true, lifesteal: 4 },
+            'b': { name: 'Toxic Ray', cooldown: 35, speed: 22, dmg: 35, count: 1, spread: 0, size: 4, color: '#84cc16', lifesteal: 12 },
+            'r': { name: 'Goo Beam (Buffed)', cooldown: 95, type: 'beam', duration: 270, dmgRate: 30, size: 16, color: '#15803d', lifesteal: 7 },
+            'q': { name: 'Acid Swarm Burst', cooldown: 60, speed: 5, dmg: 9, count: 8, spread: 0.5, size: 4, color: '#059669', homing: true, lifesteal: 4 },
+            'k': { name: 'Mega Venom Orb & Aura', cooldown: 70, speed: 2.5, dmg: 120, count: 1, spread: 0, size: 28, color: '#16a34a', lifesteal: 20, hasShield: true }
+        }
+    },
+    random: {
+        name: 'Chaos Set',
+        price: 1000,
+        desc: '⚡ WILD CARD! Random set per piece! 10% secret chance for an all-Knight army (excluding King/Queen).'
+    },
+    custom: {
+        name: 'Custom Set (UNLOCKED)',
+        price: 0,
+        desc: '🛠️ Mix & match piece sets individually! Choose Frost, Pyro, Vamp, Air, Soundwave, or Crit.'
+    }
+};
+
+let shopTab = 'PIECES'; // 'PIECES', 'COSMETIC', 'CONSUMABLES'
+let shopMessage = "";
+
+let p1SelectedSet = 'crit';
+let p2SelectedSet = 'crit';
+let board, boardSets, turn, selectedSquare, combatPending, gameWinner;
+
+function drawGoldenRookIcon(x, y, size = 20) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.fillStyle = '#ffd700';
+    ctx.strokeStyle = '#b8860b';
+    ctx.lineWidth = 1.5;
+    
+    // Castle base & crown
+    ctx.beginPath();
+    ctx.rect(0, size * 0.7, size, size * 0.3);
+    ctx.rect(size * 0.15, size * 0.3, size * 0.7, size * 0.4);
+    ctx.rect(0, 0, size * 0.25, size * 0.3);
+    ctx.rect(size * 0.375, 0, size * 0.25, size * 0.3);
+    ctx.rect(size * 0.75, 0, size * 0.25, size * 0.3);
+    ctx.fill();
+    ctx.stroke();
+
+    // Googly Eyes!
+    const eyeR = size * 0.12;
+    // Left eye
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath();
+    ctx.arc(size * 0.35, size * 0.45, eyeR, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#000000';
+    ctx.beginPath();
+    ctx.arc(size * 0.38, size * 0.45, eyeR * 0.5, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Right eye
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath();
+    ctx.arc(size * 0.65, size * 0.45, eyeR, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#000000';
+    ctx.beginPath();
+    ctx.arc(size * 0.62, size * 0.45, eyeR * 0.5, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.restore();
+}
+
+function resetGame() {
+    board = [
+        ['b_r', 'b_n', 'b_b', 'b_q', 'b_k', 'b_b', 'b_n', 'b_r'],
+        ['b_p', 'b_p', 'b_p', 'b_p', 'b_p', 'b_p', 'b_p', 'b_p'],
+        [null, null, null, null, null, null, null, null],
+        [null, null, null, null, null, null, null, null],
+        [null, null, null, null, null, null, null, null],
+        [null, null, null, null, null, null, null, null],
+        ['w_p', 'w_p', 'w_p', 'w_p', 'w_p', 'w_p', 'w_p', 'w_p'],
+        ['w_r', 'w_n', 'w_b', 'w_q', 'w_k', 'w_b', 'w_n', 'w_r']
+    ];
+
+    const baseSets = ['crit', 'air', 'frost', 'pyro', 'vampire', 'soundwave'];
+    boardSets = Array(8).fill(null).map(() => Array(8).fill(null));
+
+    const p1IsWhite = (p1Side === 'w');
+    const p1AllKnights = (p1SelectedSet === 'random') && (Math.random() < 0.10);
+    const p2AllKnights = (p2SelectedSet === 'random') && (Math.random() < 0.10);
+
+    if (p1AllKnights) unlockAchievement('mr_ed');
+
+    let hasPyro = false;
+    let hasAir = false;
+
+    for (let r = 0; r < 8; r++) {
+        for (let c = 0; c < 8; c++) {
+            if (board[r][c]) {
+                const isWhite = board[r][c][0] === 'w';
+                const pieceType = board[r][c][2];
+                const isP1Piece = (isWhite && p1IsWhite) || (!isWhite && !p1IsWhite);
+                const chosenSet = isP1Piece ? p1SelectedSet : p2SelectedSet;
+
+                if ((isP1Piece && p1AllKnights) || (!isP1Piece && p2AllKnights)) {
+                    if (pieceType !== 'k' && pieceType !== 'q') {
+                        board[r][c] = isWhite ? 'w_n' : 'b_n';
+                    }
+                }
+
+                if (chosenSet === 'random') {
+                    boardSets[r][c] = baseSets[Math.floor(Math.random() * baseSets.length)];
+                } else if (chosenSet === 'custom') {
+                    const customGrid = isP1Piece ? p1CustomGrid : p2CustomGrid;
+                    boardSets[r][c] = customGrid[r][c] || 'crit';
+                } else {
+                    boardSets[r][c] = chosenSet;
+                }
+
+                if (boardSets[r][c] === 'pyro') hasPyro = true;
+                if (boardSets[r][c] === 'air') hasAir = true;
+            }
+        }
+    }
+
+    if (hasPyro && hasAir) unlockAchievement('reunite_band');
+
+    turn = 'w';
+    selectedSquare = null;
+    combatPending = null;
+    gameWinner = null;
+    botChessTimer = 0;
+    matchShotsP1 = 0;
+    matchP1PiecesLost = 0;
+    matchKillStreak = 0;
+    p1RookLostLastTurn = false;
+    p1KnightLostLastTurn = false;
+    sneezesInMatch = 0;
+    matchAchievementsEarned = 0;
+
+    totalChessMoves = 0;
+    p1MoveCount = 0;
+    p1MovedOnlyKnights = true;
+    p1MoveHistory = {};
+    p1TurnStartTime = Date.now();
+    lastMovedPieceCoord = null;
+    movedPieceCoordsSet = new Set();
+    p1RepeatedInFirst10 = false;
+    matchP1PiecesTaken = 0;
+    movesBeforeFirstBattle = 0;
+    firstBattleHappened = false;
+    boardHistoryStack = [];
+    castlingRights = { wK: true, wQ: true, bK: true, bQ: true };
+    lastChessMove = null;
+    pendingPromotion = null;
+}
+
+function pushBoardState() {
+    boardHistoryStack.push({
+        board: JSON.parse(JSON.stringify(board)),
+        boardSets: JSON.parse(JSON.stringify(boardSets)),
+        turn: turn,
+        statsSnapshot: JSON.parse(JSON.stringify(stats)),
+        p1MoveCount: p1MoveCount,
+        matchP1PiecesTaken: matchP1PiecesTaken,
+        matchP1PiecesLost: matchP1PiecesLost,
+        castlingRights: { ...castlingRights },
+        lastChessMove: lastChessMove ? { from: { ...lastChessMove.from }, to: { ...lastChessMove.to }, piece: lastChessMove.piece } : null,
+        pendingPromotion: pendingPromotion ? { ...pendingPromotion } : null,
+        totalChessMoves: totalChessMoves,
+        p1MovedOnlyKnights: p1MovedOnlyKnights,
+        p1MoveHistory: { ...p1MoveHistory },
+        lastMovedPieceCoord: lastMovedPieceCoord,
+        movedPieceCoordsSet: [...movedPieceCoordsSet],
+        p1RepeatedInFirst10: p1RepeatedInFirst10,
+        movesBeforeFirstBattle: movesBeforeFirstBattle,
+        firstBattleHappened: firstBattleHappened
+    });
+}
+
+function undoLastMove() {
+    if (boardHistoryStack.length === 0) return false;
+    const prev = boardHistoryStack.pop();
+    board = prev.board;
+    boardSets = prev.boardSets;
+    turn = prev.turn;
+    stats = prev.statsSnapshot;
+    p1MoveCount = prev.p1MoveCount;
+    matchP1PiecesTaken = prev.matchP1PiecesTaken;
+    matchP1PiecesLost = prev.matchP1PiecesLost;
+    castlingRights = prev.castlingRights || castlingRights;
+    lastChessMove = prev.lastChessMove || null;
+    pendingPromotion = prev.pendingPromotion || null;
+    totalChessMoves = prev.totalChessMoves ?? totalChessMoves;
+    p1MovedOnlyKnights = prev.p1MovedOnlyKnights ?? p1MovedOnlyKnights;
+    p1MoveHistory = prev.p1MoveHistory || {};
+    lastMovedPieceCoord = prev.lastMovedPieceCoord || null;
+    movedPieceCoordsSet = new Set(prev.movedPieceCoordsSet || []);
+    p1RepeatedInFirst10 = prev.p1RepeatedInFirst10 ?? p1RepeatedInFirst10;
+    movesBeforeFirstBattle = prev.movesBeforeFirstBattle ?? movesBeforeFirstBattle;
+    firstBattleHappened = prev.firstBattleHappened ?? firstBattleHappened;
+    selectedSquare = null;
+    return true;
+}
+
+resetGame();
+
+const keys = {};
+window.addEventListener('keydown', e => {
+    if (rebindingKey) {
+        if (rebindingKey.player === 1) {
+            p1Keys[rebindingKey.action] = e.code;
+        } else {
+            p2Keys[rebindingKey.action] = e.code;
+        }
+        saveKeyBinds();
+        rebindingKey = null;
+        e.preventDefault();
+        return;
+    }
+
+    keys[e.code] = true;
+
+    if (gameState === STATE_MENU) {
+        if (['KeyW', 'KeyA', 'KeyS', 'KeyD', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) {
+            unlockAchievement('not_yet');
+        }
+    }
+
+    if (gameState === STATE_VICTORY && (e.code === 'Space' || e.code === 'Enter')) {
+        gameState = STATE_MENU;
+    }
+});
+window.addEventListener('keyup', e => keys[e.code] = false);
+
+window.addEventListener('wheel', (e) => {
+    if (gameState === STATE_STATS) {
+        achievementsScrollY += e.deltaY * 0.5;
+        if (achievementsScrollY < 0) achievementsScrollY = 0;
+        const maxScroll = Math.max(0, ACHIEVEMENT_LIST.length * 70 - 410);
+        if (achievementsScrollY > maxScroll) achievementsScrollY = maxScroll;
+    } else if (gameState === STATE_LOG) {
+        logScrollY += e.deltaY * 0.5;
+        if (logScrollY < 0) logScrollY = 0;
+        const maxScroll = 450;
+        if (logScrollY > maxScroll) logScrollY = maxScroll;
+    }
+});
+
+canvas.addEventListener('click', (e) => {
+    initAudio();
+    const rect = canvas.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+
+    if (gameState === STATE_MENU) {
+        if (mx >= 20 && mx <= 65 && my >= 540 && my <= 585) {
+            gameState = STATE_SETTINGS;
+            return;
+        }
+
+        if (mx >= 250 && mx <= 550 && my >= 210 && my <= 252) {
+            vsBot = true;
+            resetGame();
+            gameState = STATE_CHESS;
+        }
+        if (mx >= 250 && mx <= 550 && my >= 265 && my <= 307) {
+            gameState = STATE_SETUP;
+        }
+        if (mx >= 250 && mx <= 550 && my >= 320 && my <= 362) {
+            itemsBoughtThisVisit = 0;
+            gameState = STATE_SHOP;
+            unlockAchievement('shopper_browsing');
+        }
+        if (mx >= 250 && mx <= 550 && my >= 375 && my <= 417) {
+            gameState = STATE_STATS;
+            unlockAchievement('am_i_good');
+        }
+        if (mx >= 250 && mx <= 550 && my >= 430 && my <= 472) {
+            gameState = STATE_LOG;
+            unlockAchievement('update_log_open');
+        }
+        if (mx >= 570 && mx <= 790 && my >= 560 && my <= 595) {
+            yummySecretActive = !yummySecretActive;
+            if (yummySecretActive) {
+                playAxelFMelody();
+                unlockAchievement('fire_secret');
+            }
+        }
+    } else if (gameState === STATE_SHOP) {
+        // Tab switching
+        if (my >= 70 && my <= 105) {
+            if (mx >= 50 && mx <= 270) shopTab = 'PIECES';
+            if (mx >= 290 && mx <= 510) shopTab = 'COSMETIC';
+            if (mx >= 530 && mx <= 750) shopTab = 'CONSUMABLES';
+        }
+
+        if (shopTab === 'PIECES') {
+            const keysList = ['air', 'frost', 'soundwave', 'pyro', 'vampire', 'random'];
+            keysList.forEach((k, idx) => {
+                const itemY = 125 + idx * 58;
+                if (mx >= 550 && mx <= 730 && my >= itemY + 10 && my <= itemY + 45) {
+                    const price = CHESS_SETS[k].price;
+                    if (!shopData.unlockedSets[k]) {
+                        if (stats.golden_rooks >= price) {
+                            stats.golden_rooks -= price;
+                            shopData.unlockedSets[k] = true;
+                            shopMessage = `Bought ${CHESS_SETS[k].name}!`;
+                            itemsBoughtThisVisit++;
+                            unlockAchievement('shopping_list');
+                            if (itemsBoughtThisVisit >= 10) unlockAchievement('amazon');
+                            checkImpulsive();
+                            saveStats();
+                        } else {
+                            shopMessage = "Not enough Golden Rooks!";
+                        }
+                    }
+                }
+            });
+        } else if (shopTab === 'COSMETIC') {
+            const cosmetics = [
+                { id: 'eyeballs', name: 'Eye balls', price: 5000 },
+                { id: 'coolshadez', name: 'Cool shadez', price: 5000 },
+                { id: 'goldenboard', name: 'Golden board', price: 5000 },
+                { id: 'diamondboard', name: 'Diamond', price: 7200 },
+                { id: 'fancy', name: 'Fancy', price: 7200 }
+            ];
+
+            cosmetics.forEach((item, idx) => {
+                const itemY = 125 + idx * 68;
+                if (mx >= 550 && mx <= 730 && my >= itemY + 12 && my <= itemY + 48) {
+                    if (!shopData.cosmeticsOwned[item.id]) {
+                        if (stats.golden_rooks >= item.price) {
+                            stats.golden_rooks -= item.price;
+                            shopData.cosmeticsOwned[item.id] = true;
+                            shopData.cosmeticsEnabled[item.id] = true;
+                            shopMessage = `Purchased ${item.name}!`;
+                            itemsBoughtThisVisit++;
+                            unlockAchievement('shopping_list');
+                            if (item.id === 'goldenboard' || item.id === 'diamondboard') unlockAchievement('flex');
+                            if (item.id === 'goldenboard') unlockAchievement('golden_board_ach');
+                            if (item.id === 'fancy') unlockAchievement('fancy_ach');
+                            if (itemsBoughtThisVisit >= 10) unlockAchievement('amazon');
+                            checkImpulsive();
+                            saveStats();
+                        } else {
+                            shopMessage = "Not enough Golden Rooks!";
+                        }
+                    } else {
+                        // Toggle enable/disable
+                        shopData.cosmeticsEnabled[item.id] = !shopData.cosmeticsEnabled[item.id];
+                        saveStats();
+                    }
+                }
+            });
+        } else if (shopTab === 'CONSUMABLES') {
+            // Sneeze purchase
+            if (mx >= 550 && mx <= 730 && my >= 135 && my <= 170) {
+                if (stats.golden_rooks >= 200) {
+                    stats.golden_rooks -= 200;
+                    shopData.sneezesCount = (shopData.sneezesCount || 0) + 1;
+                    shopMessage = "Bought 1 Sneeze consumable!";
+                    itemsBoughtThisVisit++;
+                    unlockAchievement('shopping_list');
+                    if (itemsBoughtThisVisit >= 10) unlockAchievement('amazon');
+                    saveStats();
+                } else {
+                    shopMessage = "Not enough Golden Rooks!";
+                }
+            }
+
+            // Hint purchase
+            if (mx >= 550 && mx <= 730 && my >= 205 && my <= 240) {
+                if (stats.golden_rooks >= 750) {
+                    const unachieved = ACHIEVEMENT_LIST.filter(a => !achievements[a.id]);
+                    if (unachieved.length > 0) {
+                        stats.golden_rooks -= 750;
+                        const randomAch = unachieved[Math.floor(Math.random() * unachieved.length)];
+                        shopMessage = `HINT: [${randomAch.name}] - ${randomAch.desc}`;
+                        itemsBoughtThisVisit++;
+                        unlockAchievement('shopping_list');
+                        if (itemsBoughtThisVisit >= 10) unlockAchievement('amazon');
+                        saveStats();
+                    } else {
+                        shopMessage = "You unlocked all achievements already!";
+                    }
+                } else {
+                    shopMessage = "Not enough Golden Rooks!";
+                }
+            }
+
+            // Donation 1$
+            if (mx >= 550 && mx <= 730 && my >= 275 && my <= 310) {
+                if (stats.golden_rooks >= 1) {
+                    stats.golden_rooks -= 1;
+                    shopMessage = "Thank you for supporting the dev!";
+                    itemsBoughtThisVisit++;
+                    unlockAchievement('shopping_list');
+                    if (itemsBoughtThisVisit >= 10) unlockAchievement('amazon');
+                    saveStats();
+                } else {
+                    shopMessage = "Not even $1?";
+                }
+            }
+        }
+
+        if (mx >= 300 && mx <= 500 && my >= 530 && my <= 575) {
+            gameState = STATE_MENU;
+        }
+    } else if (gameState === STATE_SETTINGS) {
+        if (mx >= 250 && mx <= 550 && my >= 100 && my <= 140) {
+            soundMuted = !soundMuted;
+            localStorage.setItem('bc_muted', soundMuted ? 'true' : 'false');
+        }
+
+        const p1Actions = ['jump', 'left', 'right', 'attack'];
+        p1Actions.forEach((act, idx) => {
+            const bx = 100 + (idx % 2) * 160;
+            const by = 210 + Math.floor(idx / 2) * 45;
+            if (mx >= bx && mx <= bx + 140 && my >= by && my <= by + 35) {
+                rebindingKey = { player: 1, action: act };
+            }
+        });
+
+        const p2Actions = ['jump', 'left', 'right', 'attack'];
+        p2Actions.forEach((act, idx) => {
+            const bx = 460 + (idx % 2) * 160;
+            const by = 210 + Math.floor(idx / 2) * 45;
+            if (mx >= bx && mx <= bx + 140 && my >= by && my <= by + 35) {
+                rebindingKey = { player: 2, action: act };
+            }
+        });
+
+        if (mx >= 250 && mx <= 550 && my >= 410 && my <= 455) {
+            if (confirm("Are you sure you want to reset all stats, achievements, and custom sets?")) {
+                localStorage.removeItem('bc_stats');
+                localStorage.removeItem('bc_achievements');
+                localStorage.removeItem('bc_custom_w');
+                localStorage.removeItem('bc_custom_b');
+                localStorage.removeItem('bc_shop');
+                stats = {
+                    wins: 0, losses: 0, jumps: 0, shots: 0, distance_traveled: 0,
+                    damage_given: 0, damage_taken: 0, pieces_taken: 0, pieces_lost: 0,
+                    play_time: 0, golden_rooks: 1500, total_earned_rooks: 1500,
+                    bot_wins: { 'EASY': 0, 'MEDIUM': 0, 'HARD': 0, 'AI OVERLORD': 0 },
+                    bot_losses: { 'EASY': 0, 'MEDIUM': 0, 'HARD': 0, 'AI OVERLORD': 0 },
+                    sets_won_med: {}, soundwave_beat_sets: {}
+                };
+                shopData = { unlockedSets: { 'crit': true, 'custom': true }, cosmeticsOwned: {}, cosmeticsEnabled: {}, sneezesCount: 3 };
+                achievements = {};
+                unlockedCustomW = false;
+                unlockedCustomB = false;
+            }
+        }
+
+        if (mx >= 300 && mx <= 500 && my >= 520 && my <= 565) {
+            rebindingKey = null;
+            gameState = STATE_MENU;
+        }
+    } else if (gameState === STATE_STATS) {
+        if (mx >= 300 && mx <= 500 && my >= 530 && my <= 575) {
+            gameState = STATE_MENU;
+        }
+    } else if (gameState === STATE_LOG) {
+        if (mx >= 100 && mx <= 700 && my >= 65 && my <= 505) {
+            const lineIdx = Math.floor((my - 70 + logScrollY) / 40);
+            if (lineIdx >= 2) {
+                unlockAchievement('version_protester');
+            }
+        }
+        if (mx >= 300 && mx <= 500 && my >= 520 && my <= 565) {
+            gameState = STATE_MENU;
+        }
+    } else if (gameState === STATE_SETUP) {
+        if (mx >= 280 && mx <= 520 && my >= 50 && my <= 85) {
+            vsBot = !vsBot;
+        }
+        if (vsBot && mx >= 280 && mx <= 520 && my >= 92 && my <= 127) {
+            botDifficultyIdx = (botDifficultyIdx + 1) % BOT_DIFFICULTIES.length;
+        }
+        if (mx >= 280 && mx <= 520 && my >= 134 && my <= 169) {
+            p1Side = p1Side === 'w' ? 'b' : 'w';
+        }
+
+        if (mx >= 80 && mx <= 340 && my >= 115 && my <= 165) {
+            let input = prompt("Enter Player 1 Name (Max 12 chars):", p1Name);
+            if (input !== null && input.trim() !== "") {
+                p1Name = input.trim().substring(0, 12);
+                unlockAchievement('personality');
+                if (p1Name.toLowerCase() === 'yummystuff') {
+                    unlockAchievement('owner_plays');
+                }
+            }
+        }
+
+        if (!vsBot && mx >= 460 && mx <= 720 && my >= 140 && my <= 165) {
+            let input = prompt("Enter Player 2 Name (Max 12 chars):", p2Name);
+            if (input !== null && input.trim() !== "") {
+                p2Name = input.trim().substring(0, 12);
+                unlockAchievement('personality');
+            }
+        }
+
+        const p1CanCustom = (p1Side === 'w' && unlockedCustomW) || (p1Side === 'b' && unlockedCustomB);
+        const p2Side = p1Side === 'w' ? 'b' : 'w';
+        const p2CanCustom = (p2Side === 'w' && unlockedCustomW) || (p2Side === 'b' && unlockedCustomB);
+
+        const availableP1Sets = Object.keys(CHESS_SETS).filter(k => k !== 'custom' && shopData.unlockedSets[k]);
+        if (p1CanCustom) availableP1Sets.push('custom');
+
+        const availableP2Sets = Object.keys(CHESS_SETS).filter(k => k !== 'custom' && shopData.unlockedSets[k]);
+        if (p2CanCustom) availableP2Sets.push('custom');
+
+        availableP1Sets.forEach((key, idx) => {
+            const btnY = 175 + idx * 34;
+            if (mx >= 80 && mx <= 340 && my >= btnY && my <= btnY + 30) {
+                p1SelectedSet = key;
+                if (key === 'custom') { activeEditingPlayer = 1; gameState = STATE_CUSTOM_SETUP; }
+            }
+        });
+
+        availableP2Sets.forEach((key, idx) => {
+            const btnY = 175 + idx * 34;
+            if (mx >= 460 && mx <= 720 && my >= btnY && my <= btnY + 30) {
+                p2SelectedSet = key;
+                if (key === 'custom') { activeEditingPlayer = 2; gameState = STATE_CUSTOM_SETUP; }
+            }
+        });
+
+        if (mx >= 280 && mx <= 520 && my >= 525 && my <= 565) {
+            resetGame();
+            gameState = STATE_CHESS;
+        }
+    } else if (gameState === STATE_CUSTOM_SETUP) {
+        const startX = 160;
+        const startY = 120;
+        const tileSize = 60;
+        const pIsWhite = (activeEditingPlayer === 1 && p1Side === 'w') || (activeEditingPlayer === 2 && p1Side === 'b');
+        const activeGrid = activeEditingPlayer === 1 ? p1CustomGrid : p2CustomGrid;
+        
+        const rowsToEdit = pIsWhite ? [6, 7] : [0, 1];
+
+        rowsToEdit.forEach((r, rIdx) => {
+            for (let c = 0; c < 8; c++) {
+                const x = startX + c * tileSize;
+                const y = startY + rIdx * tileSize * 2;
+                if (mx >= x && mx <= x + tileSize && my >= y && my <= y + tileSize) {
+                    const sets = ['crit', 'air', 'frost', 'pyro', 'vampire', 'soundwave'];
+                    const current = activeGrid[r][c] || 'crit';
+                    const nextIdx = (sets.indexOf(current) + 1) % sets.length;
+                    activeGrid[r][c] = sets[nextIdx];
+                    playRetroSound(300 + nextIdx * 100, 'square', 0.08);
+                }
+            }
+        });
+
+        if (mx >= 300 && mx <= 500 && my >= 500 && my <= 545) {
+            gameState = STATE_SETUP;
+        }
+    } else if (gameState === STATE_VICTORY) {
+        gameState = STATE_MENU;
+    } else if (gameState === STATE_CHESS) {
+        // Sneeze / Undo Button Click
+        if (mx >= 660 && mx <= 780 && my >= 540 && my <= 585) {
+            if ((shopData.sneezesCount || 0) > 0) {
+                if (undoLastMove()) {
+                    shopData.sneezesCount--;
+                    sneezesInMatch++;
+                    if (sneezesInMatch >= 5) unlockAchievement('plague');
+                    saveStats();
+                    playRetroSound(180, 'triangle', 0.2);
+                }
+            }
+            return;
+        }
+
+        const botTurnColor = p1Side === 'w' ? 'b' : 'w';
+        if (vsBot && turn === botTurnColor) return;
+        const x = mx - 160;
+        const y = my - 60;
+        if (x < 0 || x >= 480 || y < 0 || y >= 480) return;
+        const col = Math.floor(x / 60);
+        const row = Math.floor(y / 60);
+        handleChessClick(row, col);
+    }
+});
+
+function recordMove(fromR, fromC, toR, toC, piece) {
+    totalChessMoves++;
+    const isP1Turn = (turn === p1Side);
+
+    if (!firstBattleHappened) {
+        movesBeforeFirstBattle++;
+        if (movesBeforeFirstBattle >= 8) unlockAchievement('manthey');
+    }
+
+    if (isP1Turn) {
+        if (p1TurnStartTime > 0 && (Date.now() - p1TurnStartTime) > 59000) {
+            unlockAchievement('long_thinker');
+        }
+
+        p1MoveCount++;
+        if (piece[2] !== 'n') p1MovedOnlyKnights = false;
+
+        const fromKey = `${fromR},${fromC}`;
+        if (lastMovedPieceCoord === fromKey) unlockAchievement('lost_tempo');
+        lastMovedPieceCoord = `${toR},${toC}`;
+
+        if (p1MoveCount <= 10) {
+            if (movedPieceCoordsSet.has(fromKey)) {
+                p1RepeatedInFirst10 = true;
+            } else {
+                movedPieceCoordsSet.add(`${toR},${toC}`);
+            }
+            if (p1MoveCount === 10 && !p1RepeatedInFirst10) unlockAchievement('good_tempo');
+        }
+
+        const moveKey = `${fromR},${fromC}->${toR},${toC}`;
+        p1MoveHistory[moveKey] = (p1MoveHistory[moveKey] || 0) + 1;
+        if (p1MoveHistory[moveKey] >= 3) unlockAchievement('memory_loss');
+    }
+}
+
+function isPromotionSquare(row, color) {
+    return (color === 'w' && row === 0) || (color === 'b' && row === 7);
+}
+
+function updateCastlingRightsAfterMove(piece, fromR, fromC, toR, toC, capturedPiece = null) {
+    const color = piece[0];
+    if (piece[2] === 'k') {
+        castlingRights[color + 'K'] = false;
+        castlingRights[color + 'Q'] = false;
+    }
+    if (piece[2] === 'r') {
+        if (color === 'w' && fromR === 7 && fromC === 0) castlingRights.wQ = false;
+        if (color === 'w' && fromR === 7 && fromC === 7) castlingRights.wK = false;
+        if (color === 'b' && fromR === 0 && fromC === 0) castlingRights.bQ = false;
+        if (color === 'b' && fromR === 0 && fromC === 7) castlingRights.bK = false;
+    }
+    if (capturedPiece && capturedPiece[2] === 'r') {
+        const cc = capturedPiece[0];
+        if (cc === 'w' && toR === 7 && toC === 0) castlingRights.wQ = false;
+        if (cc === 'w' && toR === 7 && toC === 7) castlingRights.wK = false;
+        if (cc === 'b' && toR === 0 && toC === 0) castlingRights.bQ = false;
+        if (cc === 'b' && toR === 0 && toC === 7) castlingRights.bK = false;
+    }
+}
+
+function isCastlingMove(r1, c1, r2, c2, piece) {
+    if (!piece || piece[2] !== 'k' || r1 !== r2 || Math.abs(c2 - c1) !== 2) return false;
+    const color = piece[0];
+    const row = color === 'w' ? 7 : 0;
+    if (r1 !== row || c1 !== 4) return false;
+    const kingSide = c2 === 6;
+    const queenSide = c2 === 2;
+    if (!kingSide && !queenSide) return false;
+    const rights = kingSide ? castlingRights[color + 'K'] : castlingRights[color + 'Q'];
+    if (!rights) return false;
+    const rookCol = kingSide ? 7 : 0;
+    const rook = board[row][rookCol];
+    if (rook !== color + '_r') return false;
+    const between = kingSide ? [5, 6] : [1, 2, 3];
+    return between.every(c => !board[row][c]);
+}
+
+function isEnPassantMove(r1, c1, r2, c2, piece) {
+    if (!piece || piece[2] !== 'p' || !lastChessMove || board[r2][c2]) return false;
+    const dir = piece[0] === 'w' ? -1 : 1;
+    if (r2 - r1 !== dir || Math.abs(c2 - c1) !== 1) return false;
+    const lp = lastChessMove;
+    if (!lp.piece || lp.piece[2] !== 'p' || lp.piece[0] === piece[0]) return false;
+    if (lp.from.r !== (piece[0] === 'w' ? 1 : 6)) return false;
+    if (lp.to.r !== (piece[0] === 'w' ? 3 : 4)) return false;
+    if (lp.to.c !== c2 || lp.from.c !== c2) return false;
+    return r1 === lp.to.r && Math.abs(lp.to.c - c1) === 1;
+}
+
+function promotePiece(row, col, color, isP1Turn) {
+    let choice = 'q';
+    if (!vsBot || isP1Turn) {
+        const answer = prompt('PROMOTION! Choose: Q = Queen, R = Rook, B = Bishop, N = Knight', 'Q');
+        if (answer) {
+            const c = answer.trim().toLowerCase()[0];
+            if ('qrbn'.includes(c)) choice = c;
+        }
+    }
+    board[row][col] = color + '_' + choice;
+    pendingPromotion = null;
+    if (isP1Turn) unlockAchievement('promotion');
+}
+
+function completeNormalMove(fromR, fromC, toR, toC, piece) {
+    const captured = board[toR][toC];
+    board[toR][toC] = piece;
+    board[fromR][fromC] = null;
+    boardSets[toR][toC] = boardSets[fromR][fromC];
+    boardSets[fromR][fromC] = null;
+    updateCastlingRightsAfterMove(piece, fromR, fromC, toR, toC, captured);
+    if (isPromotionSquare(toR, piece[0]) && piece[2] === 'p') {
+        pendingPromotion = { r: toR, c: toC, color: piece[0] };
+        promotePiece(toR, toC, piece[0], piece[0] === p1Side);
+    }
+    lastChessMove = { from: { r: fromR, c: fromC }, to: { r: toR, c: toC }, piece: piece };
+    turn = turn === 'w' ? 'b' : 'w';
+    if (turn === p1Side) p1TurnStartTime = Date.now();
+    selectedSquare = null;
+    playRetroSound(200, 'sine', 0.05);
+}
+
+function completeCastle(fromR, fromC, toR, toC, piece, isP1Turn) {
+    const row = piece[0] === 'w' ? 7 : 0;
+    const kingSide = toC === 6;
+    const rookFromC = kingSide ? 7 : 0;
+    const rookToC = kingSide ? 5 : 3;
+    const rook = board[row][rookFromC];
+    const rookSet = boardSets[row][rookFromC];
+    board[toR][toC] = piece;
+    board[fromR][fromC] = null;
+    board[row][rookToC] = rook;
+    board[row][rookFromC] = null;
+    boardSets[toR][toC] = boardSets[fromR][fromC];
+    boardSets[fromR][fromC] = null;
+    boardSets[row][rookToC] = rookSet;
+    boardSets[row][rookFromC] = null;
+    castlingRights[piece[0] + 'K'] = false;
+    castlingRights[piece[0] + 'Q'] = false;
+    lastChessMove = { from: { r: fromR, c: fromC }, to: { r: toR, c: toC }, piece: piece, castle: true };
+    if (isP1Turn) unlockAchievement('castling');
+    turn = turn === 'w' ? 'b' : 'w';
+    if (turn === p1Side) p1TurnStartTime = Date.now();
+    selectedSquare = null;
+    playRetroSound(320, 'square', 0.08);
+}
+
+function handleChessClick(row, col) {
+    const piece = board[row][col];
+    if (pendingPromotion) return;
+    if (selectedSquare) {
+        if (selectedSquare.r === row && selectedSquare.c === col) { selectedSquare = null; return; }
+        const selPiece = board[selectedSquare.r][selectedSquare.c];
+        if (!selPiece) { selectedSquare = null; return; }
+        const fromR = selectedSquare.r, fromC = selectedSquare.c;
+        const isP1Turn = (turn === p1Side);
+        const castle = isCastlingMove(fromR, fromC, row, col, selPiece);
+        const enPassant = isEnPassantMove(fromR, fromC, row, col, selPiece);
+        if (castle || enPassant || isValidMove(fromR, fromC, row, col, selPiece)) {
+            pushBoardState();
+            if (isP1Turn) unlockAchievement('getting_started');
+            recordMove(fromR, fromC, row, col, selPiece);
+            if (castle) { completeCastle(fromR, fromC, row, col, selPiece, isP1Turn); return; }
+            if (enPassant) {
+                const capturedR = selPiece[0] === 'w' ? row + 1 : row - 1;
+                const capturedCode = board[capturedR][col];
+                firstBattleHappened = true;
+                initArena({r: fromR, c: fromC}, {r: capturedR, c: col}, { enPassant: true, destination: {r: row, c: col}, captured: capturedCode });
+                return;
+            }
+            if (piece && piece[0] !== turn) {
+                firstBattleHappened = true;
+                initArena({r: fromR, c: fromC}, {r: row, c: col});
+            } else if (!piece) {
+                completeNormalMove(fromR, fromC, row, col, selPiece);
+            }
+        } else if (piece && piece[0] === turn) { selectedSquare = { r: row, c: col }; }
+    } else if (piece && piece[0] === turn) { selectedSquare = { r: row, c: col }; }
+}
+
+function updateChessBot() {
+    const botColor = p1Side === 'w' ? 'b' : 'w';
+    if (!vsBot || turn !== botColor || gameState !== STATE_CHESS) return;
+    botChessTimer++;
+    
+    const diff = BOT_DIFFICULTIES[botDifficultyIdx];
+    const delayTarget = diff === 'EASY' ? 85 : diff === 'MEDIUM' ? 55 : diff === 'HARD' ? 20 : 5;
+    if (botChessTimer < delayTarget) return;
+    botChessTimer = 0;
+
+    let moves = [];
+    const pieceValues = { 'p': 10, 'n': 30, 'b': 30, 'r': 50, 'q': 90, 'k': 900 };
+
+    for (let r1 = 0; r1 < 8; r1++) {
+        for (let c1 = 0; c1 < 8; c1++) {
+            const piece = board[r1][c1];
+            if (piece && piece[0] === botColor) {
+                for (let r2 = 0; r2 < 8; r2++) {
+                    for (let c2 = 0; c2 < 8; c2++) {
+                        if (isValidMove(r1, c1, r2, c2, piece) || isCastlingMove(r1, c1, r2, c2, piece) || isEnPassantMove(r1, c1, r2, c2, piece)) {
+                            const target = board[r2][c2];
+                            const isCapture = target && target[0] !== botColor;
+                            const val = isCapture ? (pieceValues[target[2]] || 0) : 0;
+                            moves.push({ from: { r: r1, c: c1 }, to: { r: r2, c: c2 }, isCapture, value: val });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (moves.length > 0) {
+        let chosen;
+        if (diff === 'EASY') {
+            chosen = moves[Math.floor(Math.random() * moves.length)];
+        } else if (diff === 'MEDIUM') {
+            const captures = moves.filter(m => m.isCapture);
+            chosen = captures.length > 0 ? captures[Math.floor(Math.random() * captures.length)] : moves[Math.floor(Math.random() * moves.length)];
+        } else if (diff === 'HARD') {
+            moves.sort((a, b) => b.value - a.value);
+            chosen = moves[0];
+        } else {
+            moves.sort((a, b) => {
+                if (b.value !== a.value) return b.value - a.value;
+                return b.to.r - a.to.r;
+            });
+            chosen = moves[0];
+        }
+
+        pushBoardState();
+        const selPiece = board[chosen.from.r][chosen.from.c];
+        const targetPiece = board[chosen.to.r][chosen.to.c];
+        const botCastle = isCastlingMove(chosen.from.r, chosen.from.c, chosen.to.r, chosen.to.c, selPiece);
+        const botEP = isEnPassantMove(chosen.from.r, chosen.from.c, chosen.to.r, chosen.to.c, selPiece);
+
+        recordMove(chosen.from.r, chosen.from.c, chosen.to.r, chosen.to.c, selPiece);
+
+        if (botCastle) {
+            completeCastle(chosen.from.r, chosen.from.c, chosen.to.r, chosen.to.c, selPiece, false);
+        } else if (targetPiece) {
+            firstBattleHappened = true;
+            initArena(chosen.from, chosen.to);
+        } else if (botEP) {
+            const capturedR = selPiece[0] === 'w' ? chosen.to.r + 1 : chosen.to.r - 1;
+            firstBattleHappened = true;
+            initArena(chosen.from, {r: capturedR, c: chosen.to.c}, { enPassant: true, destination: chosen.to });
+        } else {
+            completeNormalMove(chosen.from.r, chosen.from.c, chosen.to.r, chosen.to.c, selPiece);
+        }
+    }
+}
+
+function isValidMove(r1, c1, r2, c2, piece) {
+    const target = board[r2][c2];
+    if (target && target[0] === piece[0]) return false;
+
+    const type = piece[2];
+    const dr = r2 - r1;
+    const dc = c2 - c1;
+    const absDr = Math.abs(dr);
+    const absDc = Math.abs(dc);
+    const dir = piece[0] === 'w' ? -1 : 1;
+
+    switch (type) {
+        case 'p':
+            if (dc === 0 && !target) {
+                if (dr === dir) return true;
+                if ((r1 === 6 && piece[0] === 'w' || r1 === 1 && piece[0] === 'b') && dr === 2 * dir && !board[r1 + dir][c1]) return true;
+            } else if (absDc === 1 && dr === dir && target) {
+                return true;
+            }
+            return false;
+        case 'r': return (r1 === r2 || c1 === c2) && isPathClear(r1, c1, r2, c2);
+        case 'b': return absDr === absDc && isPathClear(r1, c1, r2, c2);
+        case 'q': return (r1 === r2 || c1 === c2 || absDr === absDc) && isPathClear(r1, c1, r2, c2);
+        case 'n': return (absDr === 2 && absDc === 1) || (absDr === 1 && absDc === 2);
+        case 'k': return absDr <= 1 && absDc <= 1;
+    }
+    return false;
+}
+
+function isPathClear(r1, c1, r2, c2) {
+    const stepR = Math.sign(r2 - r1);
+    const stepC = Math.sign(c2 - c1);
+    let currR = r1 + stepR;
+    let currC = c1 + stepC;
+    while (currR !== r2 || currC !== c2) {
+        if (board[currR][currC]) return false;
+        currR += stepR;
+        currC += stepC;
+    }
+    return true;
+}
+
+function getMapForFile(col) {
+    const baseFloor = { x: 0, y: 520, w: 800, h: 80, isSolid: true };
+    const files = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'];
+    const fileName = files[col];
+
+    switch(col) {
+        case 0:
+        case 7:
+            return { name: `${fileName}-FILE: WIDE OPEN ARENA`, platforms: [baseFloor] };
+        case 1:
+        case 6:
+            return {
+                name: `${fileName}-FILE: 70% BARRIER ARENA`,
+                platforms: [
+                    baseFloor,
+                    { x: 180, y: 489, w: 80, h: 31, isSolid: true },
+                    { x: 360, y: 489, w: 80, h: 31, isSolid: true },  
+                    { x: 540, y: 489, w: 80, h: 31, isSolid: true },  
+                    { x: 260, y: 380, w: 90, h: 16, isSolid: false },   
+                    { x: 450, y: 380, w: 90, h: 16, isSolid: false }    
+                ]
+            };
+        case 2:
+        case 5:
+            return {
+                name: `${fileName}-FILE: BISHOP 2-LEVEL ARENA`,
+                platforms: [baseFloor, { x: 140, y: 390, w: 520, h: 20, isSolid: false }]
+            };
+        case 3:
+            return {
+                name: `${fileName}-FILE: COMBINATION ARENA`,
+                platforms: [
+                    baseFloor,
+                    { x: 60, y: 390, w: 200, h: 16, isSolid: false },   
+                    { x: 365, y: 420, w: 70, h: 100, isSolid: true },   
+                    { x: 500, y: 320, w: 160, h: 16, isSolid: false },  
+                    { x: 320, y: 210, w: 160, h: 16, isSolid: false }   
+                ]
+            };
+        case 4:
+            return {
+                name: `${fileName}-FILE: KING'S LABYRINTH ARENA`,
+                platforms: [
+                    baseFloor,
+                    { x: 0, y: 200, w: 200, h: 16, isSolid: false },
+                    { x: 360, y: 150, w: 80, h: 14, isSolid: false },
+                    { x: 600, y: 200, w: 200, h: 16, isSolid: false },
+                    { x: 260, y: 200, w: 16, h: 60, isSolid: true },
+                    { x: 260, y: 260, w: 90, h: 14, isSolid: false },
+                    { x: 524, y: 200, w: 16, h: 60, isSolid: true },
+                    { x: 450, y: 260, w: 90, h: 14, isSolid: false },
+                    { x: 375, y: 270, w: 16, h: 60, isSolid: true },
+                    { x: 409, y: 270, w: 16, h: 60, isSolid: true },
+                    { x: 0, y: 340, w: 180, h: 16, isSolid: false },
+                    { x: 620, y: 340, w: 180, h: 16, isSolid: false },
+                    { x: 250, y: 360, w: 16, h: 60, isSolid: true },
+                    { x: 250, y: 350, w: 100, h: 14, isSolid: false },
+                    { x: 534, y: 360, w: 16, h: 60, isSolid: true },
+                    { x: 450, y: 350, w: 100, h: 14, isSolid: false },
+                    { x: 200, y: 440, w: 150, h: 14, isSolid: false },
+                    { x: 450, y: 440, w: 150, h: 14, isSolid: false },
+                    { x: 150, y: 460, w: 16, h: 60, isSolid: true },
+                    { x: 392, y: 450, w: 16, h: 70, isSolid: true },
+                    { x: 634, y: 460, w: 16, h: 60, isSolid: true }
+                ]
+            };
+        default:
+            return { name: 'STANDARD ARENA', platforms: [baseFloor] };
+    }
+}
+
+let p1, p2, projectiles, floatTexts, beams, vibrationFields, platforms, currentMapName, arenaWinner, battleTimer;
+
+function spawnVibrationField(x, y, owner) {
+    if (!vibrationFields) vibrationFields = [];
+    vibrationFields.push({ x: x - 87.5, y: y - 87.5, w: 175, h: 175, life: 90, owner: owner });
+    if (vibrationFields.length > 8) vibrationFields.shift();
+}
+
+class Fighter {
+    constructor(x, y, color, isP1, pieceCode, setType) {
+        this.x = x;
+        this.y = y;
+        this.w = 32;
+        this.h = 44;
+        this.vx = 0;
+        this.vy = 0;
+        this.color = color;
+        this.isP1 = isP1;
+        this.hp = 100;
+        this.pieceCode = pieceCode;
+        this.pieceType = pieceCode[2];
+        this.setType = setType;
+        this.weapon = CHESS_SETS[setType].weapons[this.pieceType];
+        this.facing = isP1 ? 1 : -1;
+        this.grounded = false;
+        this.cooldown = 0;
+        this.statuses = [];
+
+        this.slowStacks = 0;
+        this.slowTimer = 0;
+        this.freezeTimer = 0;
+        this.airHitsInAir = 0;
+        this.kingPassiveTimer = 0;
+        this.kingPassiveAngle = 0;
+        this.burstRemaining = 0;
+        this.burstTimer = 0;
+        this.tookDamageInArena = false;
+    }
+
+    update(opponent) {
+        if (this.weapon.isSoundwaveKing) {
+            this.kingPassiveTimer++;
+            if (this.kingPassiveTimer >= 16) {
+                this.kingPassiveTimer = 0;
+                const rad = (this.kingPassiveAngle * Math.PI) / 180;
+                projectiles.push({
+                    x: this.x + this.w / 2,
+                    y: this.y + this.h / 2,
+                    vx: Math.cos(rad) * 6,
+                    vy: Math.sin(rad) * 6,
+                    radius: 5,
+                    dmg: 8,
+                    color: '#dfb15b',
+                    owner: this,
+                    isVibrate: true
+                });
+                this.kingPassiveAngle = (this.kingPassiveAngle + 10) % 360;
+            }
+        }
+
+        if (this.burstRemaining > 0) {
+            this.burstTimer++;
+            if (this.burstTimer >= 6) {
+                this.burstTimer = 0;
+                this.burstRemaining--;
+                playShootSFX();
+                projectiles.push({
+                    x: this.facing === 1 ? this.x + this.w + 4 : this.x - 10,
+                    y: this.y + 16,
+                    vx: this.facing * 13,
+                    vy: (Math.random() - 0.5) * 1.5,
+                    radius: 5,
+                    dmg: 12,
+                    color: '#c5a059',
+                    owner: this,
+                    isVibrate: true
+                });
+            }
+        }
+
+        if (this.freezeTimer > 0) {
+            this.freezeTimer--;
+            this.vx = 0;
+        } else {
+            const isHumanBotControl = !this.isP1 && !vsBot;
+
+            if (this.isP1) {
+                if (keys[p1Keys.left]) { this.vx = -4; this.facing = -1; }
+                else if (keys[p1Keys.right]) { this.vx = 4; this.facing = 1; }
+                else { this.vx *= 0.7; }
+
+                if (keys[p1Keys.jump] && this.grounded) {
+                    this.vy = -12;
+                    this.grounded = false;
+                    playJumpSFX();
+                    stats.jumps++;
+                    saveStats();
+                }
+                if (keys[p1Keys.attack] && this.cooldown <= 0) { this.shoot(); }
+
+                stats.distance_traveled += Math.abs(this.vx);
+            } else if (isHumanBotControl) {
+                if (keys[p2Keys.left]) { this.vx = -4; this.facing = -1; }
+                else if (keys[p2Keys.right]) { this.vx = 4; this.facing = 1; }
+                else { this.vx *= 0.7; }
+
+                if (keys[p2Keys.jump] && this.grounded) { this.vy = -12; this.grounded = false; playJumpSFX(); }
+                if (keys[p2Keys.attack] && this.cooldown <= 0) { this.shoot(); }
+            } else {
+                const dx = opponent.x - this.x;
+                this.facing = dx > 0 ? 1 : -1;
+                const diff = BOT_DIFFICULTIES[botDifficultyIdx];
+
+                let speedMult = diff === 'EASY' ? 0.3 : diff === 'MEDIUM' ? 0.6 : diff === 'HARD' ? 1.1 : 1.35;
+
+                let dodgeJump = false;
+                if (diff === 'HARD' || diff === 'AI OVERLORD') {
+                    const threatDist = diff === 'AI OVERLORD' ? 180 : 110;
+                    const danger = projectiles.some(p => p.owner !== this && Math.abs(p.x - this.x) < threatDist && Math.abs(p.y - this.y) < 50);
+                    if (danger && this.grounded) dodgeJump = true;
+                }
+
+                if (Math.abs(dx) > 220) {
+                    this.vx = this.facing * 3.6 * speedMult;
+                } else if (Math.abs(dx) < 70) {
+                    this.vx = -this.facing * 3.2 * speedMult;
+                } else {
+                    this.vx *= 0.7;
+                }
+
+                const jumpChance = diff === 'EASY' ? 0.001 : diff === 'MEDIUM' ? 0.005 : diff === 'HARD' ? 0.04 : 0.08;
+                if (this.grounded && (dodgeJump || Math.random() < jumpChance || (opponent.y < this.y - 40 && Math.random() < 0.1))) {
+                    this.vy = diff === 'AI OVERLORD' ? -13.5 : -12;
+                    this.grounded = false;
+                    playJumpSFX();
+                }
+
+                let canShoot = diff === 'EASY' ? (Math.random() < 0.12) : diff === 'MEDIUM' ? (Math.random() < 0.35) : true;
+                if (this.cooldown <= 0 && canShoot) {
+                    this.shoot();
+                }
+            }
+        }
+
+        if (this.slowTimer > 0) {
+            this.slowTimer--;
+            const slowFactor = 1 - (0.15 * this.slowStacks);
+            this.vx *= slowFactor;
+            if (this.slowTimer <= 0) this.slowStacks = 0;
+        }
+
+        this.x += this.vx;
+        platforms.forEach(p => {
+            if (p.isSolid) {
+                if (this.x < p.x + p.w && this.x + this.w > p.x &&
+                    this.y < p.y + p.h && this.y + this.h > p.y) {
+                    if (this.vx > 0) this.x = p.x - this.w;
+                    else if (this.vx < 0) this.x = p.x + p.w;
+                    this.vx = 0;
+                }
+            }
+        });
+
+        const prevY = this.y;
+        this.vy += 0.5;
+        this.y += this.vy;
+        this.grounded = false;
+
+        platforms.forEach(p => {
+            if (p.isSolid) {
+                if (this.x < p.x + p.w && this.x + this.w > p.x &&
+                    this.y < p.y + p.h && this.y + this.h > p.y) {
+                    if (this.vy > 0) {
+                        this.y = p.y - this.h;
+                        this.vy = 0;
+                        this.grounded = true;
+                    } else if (this.vy < 0) {
+                        this.y = p.y + p.h;
+                        this.vy = 0;
+                    }
+                }
+            } else {
+                if (this.x + this.w > p.x && this.x < p.x + p.w) {
+                    if (prevY + this.h <= p.y + 4 && this.y + this.h >= p.y && this.vy >= 0) {
+                        this.y = p.y - this.h;
+                        this.vy = 0;
+                        this.grounded = true;
+                    }
+                }
+            }
+        });
+
+        if (this.cooldown > 0) this.cooldown--;
+
+        if (this.x < 0) this.x = 0;
+        if (this.x + this.w > canvas.width) this.x = canvas.width - this.w;
+
+        if (this.weapon.hasShield && opponent) {
+            const shieldRadius = 70;
+            const cx = this.x + this.w / 2;
+            const cy = this.y + this.h / 2;
+            const ox = opponent.x + opponent.w / 2;
+            const oy = opponent.y + opponent.h / 2;
+            const dist = Math.hypot(ox - cx, oy - cy);
+
+            if (dist < shieldRadius + 16) {
+                const shieldDmg = 5 / 60;
+                opponent.hp -= shieldDmg;
+                opponent.tookDamageInArena = true;
+                if (this.isP1) stats.damage_given += shieldDmg;
+                else if (opponent.isP1) stats.damage_taken += shieldDmg;
+
+                if (this.setType === 'pyro') opponent.addStatus('burn', 5, 180, this);
+                else if (this.setType === 'vampire') {
+                    this.hp = Math.min(100, this.hp + shieldDmg);
+                }
+            }
+        }
+
+        if (this.weapon.hasAirShield && opponent) {
+            const shieldRadius = 75;
+            const cx = this.x + this.w / 2;
+            const cy = this.y + this.h / 2;
+            const ox = opponent.x + opponent.w / 2;
+            const oy = opponent.y + opponent.h / 2;
+            const dist = Math.hypot(ox - cx, oy - cy);
+
+            if (dist < shieldRadius + 16) {
+                const pushDir = ox > cx ? 1 : -1;
+                opponent.vx = pushDir * 9;
+                floatTexts.push({ text: 'REPEL!', x: opponent.x + 10, y: opponent.y - 10, life: 20, color: '#0284c7' });
+            }
+        }
+
+        for (let i = this.statuses.length - 1; i >= 0; i--) {
+            const st = this.statuses[i];
+            st.timer++;
+            if (st.timer % st.interval === 0) {
+                this.hp -= st.dmg;
+                this.tookDamageInArena = true;
+                if (this.isP1) stats.damage_taken += st.dmg;
+                else stats.damage_given += st.dmg;
+                playHitSFX();
+            }
+            if (st.timer >= 600) this.statuses.splice(i, 1);
+        }
+
+        if (this.hp <= 0) this.hp = 0;
+    }
+
+    applyFrostEffect(shooter) {
+        if (Math.random() < 0.075) {
+            this.freezeTimer = 120;
+            if (shooter.isP1) unlockAchievement('ice_cube');
+            floatTexts.push({ text: 'FROZEN!', x: this.x + 10, y: this.y - 10, life: 40, color: '#00dfff' });
+        }
+        this.slowStacks = Math.min(3, this.slowStacks + 1);
+        this.slowTimer = 210;
+        floatTexts.push({ text: `SLOW -${this.slowStacks * 15}%`, x: this.x + 10, y: this.y - 25, life: 30, color: '#70d6ff' });
+    }
+
+    addStatus(type, dmg, interval, source) {
+        let finalDmg = dmg;
+        if (source && source.isP1 && yummySecretActive && type === 'burn') {
+            finalDmg *= 5;
+        }
+
+        if (!this.statuses.some(s => s.type === type)) {
+            this.statuses.push({ type, dmg: finalDmg, interval, timer: 0, source });
+        }
+    }
+
+    shoot() {
+        this.cooldown = this.weapon.cooldown;
+        playShootSFX();
+
+        if (this.isP1) {
+            stats.shots++;
+            matchShotsP1++;
+            saveStats();
+            if (matchShotsP1 > 300) unlockAchievement('spammer');
+        }
+
+        const startX = this.facing === 1 ? this.x + this.w + 4 : this.x - 10;
+        const startY = this.y + 16;
+
+        if (this.weapon.isSoundwaveRook || this.weapon.isSoundwaveQueen) {
+            this.burstRemaining = 3;
+            this.burstTimer = 0;
+        }
+
+        if (this.weapon.isSoundwaveKnight || this.weapon.isSoundwaveQueen) {
+            for (let i = 0; i < 4; i++) {
+                const spreadAngle = (Math.random() - 0.5) * 0.4;
+                projectiles.push({
+                    x: this.x - 6,
+                    y: startY,
+                    vx: Math.cos(spreadAngle) * 9 * (-this.facing),
+                    vy: Math.sin(spreadAngle) * 9,
+                    radius: 4,
+                    dmg: 10,
+                    color: '#e6c280',
+                    owner: this,
+                    isVibrate: true
+                });
+            }
+            if (this.weapon.isSoundwaveKnight) {
+                for (let i = 0; i < 6; i++) {
+                    const spreadAngle = (Math.random() - 0.5) * 0.4;
+                    projectiles.push({
+                        x: startX,
+                        y: startY,
+                        vx: Math.cos(spreadAngle) * 10 * this.facing,
+                        vy: Math.sin(spreadAngle) * 10,
+                        radius: 4,
+                        dmg: 10,
+                        color: '#e6c280',
+                        owner: this,
+                        isVibrate: true
+                    });
+                }
+            }
+        }
+
+        if (this.weapon.isSineWave) {
+            projectiles.push({
+                x: startX,
+                y: startY,
+                vx: 15 * this.facing,
+                vy: 0,
+                baseY: startY,
+                distTraveled: 0,
+                radius: 5,
+                dmg: 35,
+                color: '#f5d089',
+                owner: this,
+                isSineWave: true,
+                isVibrate: true
+            });
+            return;
+        }
+
+        if (this.weapon.isSoundwaveKing) {
+            for (let i = -1; i <= 1; i++) {
+                projectiles.push({
+                    x: startX,
+                    y: startY + i * 12,
+                    vx: 7 * this.facing,
+                    vy: i * 2,
+                    radius: 6,
+                    dmg: 25,
+                    color: '#dfb15b',
+                    owner: this,
+                    isSoundwaveHoming: true,
+                    isVibrate: true
+                });
+            }
+            return;
+        }
+
+        if (this.weapon.type === 'beam') {
+            beams.push({
+                owner: this,
+                x: startX,
+                y: startY - 8,
+                w: this.facing === 1 ? canvas.width - startX : startX,
+                h: this.weapon.size,
+                duration: this.weapon.duration,
+                dmgRate: this.weapon.dmgRate,
+                color: this.weapon.color,
+                facing: this.facing,
+                status: this.weapon.status,
+                isFrost: !!this.weapon.isFrost
+            });
+            return;
+        }
+
+        if (this.weapon.isOmni) {
+            for (let i = 0; i < 16; i++) {
+                const angle = (i / 16) * Math.PI * 2;
+                projectiles.push({
+                    x: this.x + this.w / 2,
+                    y: this.y + this.h / 2,
+                    vx: Math.cos(angle) * this.weapon.speed,
+                    vy: Math.sin(angle) * this.weapon.speed,
+                    radius: this.weapon.size,
+                    dmg: this.weapon.dmg,
+                    color: this.weapon.color,
+                    owner: this,
+                    isAir: true
+                });
+            }
+            return;
+        }
+
+        if (this.weapon.isWave) {
+            for (let i = 0; i < this.weapon.count; i++) {
+                const spreadAngle = (Math.random() - 0.5) * this.weapon.spread;
+                projectiles.push({
+                    x: startX,
+                    y: startY + (i - 1) * 6,
+                    vx: Math.cos(spreadAngle) * this.weapon.speed * this.facing,
+                    vy: Math.sin(spreadAngle) * this.weapon.speed,
+                    radius: this.weapon.size,
+                    dmg: this.weapon.dmg,
+                    color: this.weapon.color,
+                    owner: this,
+                    isAir: true,
+                    isWave: true,
+                    waveTimer: i * 8,
+                    baseVy: Math.sin(spreadAngle) * this.weapon.speed
+                });
+            }
+            return;
+        }
+
+        if (this.weapon.count) {
+            for (let i = 0; i < this.weapon.count; i++) {
+                const spreadAngle = (Math.random() - 0.5) * (this.weapon.spread || 0);
+                const vx = Math.cos(spreadAngle) * this.weapon.speed * this.facing;
+                const vy = Math.sin(spreadAngle) * this.weapon.speed;
+
+                let finalDmg = this.weapon.dmg;
+                let isCrit = false;
+                if (this.weapon.critChance && Math.random() < this.weapon.critChance) {
+                    finalDmg += this.weapon.critDmg;
+                    isCrit = true;
+                }
+
+                projectiles.push({
+                    x: startX,
+                    y: startY,
+                    vx: vx,
+                    vy: vy,
+                    radius: isCrit ? this.weapon.size + 2 : this.weapon.size,
+                    dmg: finalDmg,
+                    color: isCrit ? '#ffff00' : this.weapon.color,
+                    owner: this,
+                    homing: !!this.weapon.homing,
+                    status: this.weapon.status,
+                    lifesteal: this.weapon.lifesteal || 0,
+                    isCrit: isCrit,
+                    isFrost: !!this.weapon.isFrost,
+                    isAir: !!this.weapon.isAir,
+                    isTornado: !!this.weapon.isTornado,
+                    isVibrate: !!this.weapon.isVibrate
+                });
+            }
+        }
+    }
+
+    draw() {
+        let setOutline;
+        if (this.setType === 'pyro') setOutline = '#f97316';
+        else if (this.setType === 'vampire') setOutline = '#22c55e';
+        else if (this.setType === 'frost') setOutline = '#00dfff';
+        else if (this.setType === 'air') setOutline = '#7dd3fc';
+        else if (this.setType === 'soundwave') setOutline = '#d2b48c';
+        else setOutline = '#eab308';
+
+        ctx.fillStyle = this.color;
+        ctx.fillRect(this.x, this.y, this.w, this.h);
+        
+        ctx.font = 'bold 24px Arial';
+        ctx.textAlign = 'center';
+
+        ctx.strokeStyle = setOutline;
+        ctx.lineWidth = 3;
+        ctx.strokeText(PIECE_SYMBOLS[this.pieceCode], this.x + this.w/2, this.y + 30);
+        ctx.fillStyle = this.pieceCode[0] === 'w' ? '#ffffff' : '#0f172a';
+        ctx.fillText(PIECE_SYMBOLS[this.pieceCode], this.x + this.w/2, this.y + 30);
+
+        ctx.fillStyle = '#94a3b8';
+        const gunX = this.facing === 1 ? this.x + this.w : this.x - 12;
+        ctx.fillRect(gunX, this.y + 18, 12, 6);
+
+        // Cosmetics rendering on fighters
+        if (shopData.cosmeticsOwned['eyeballs'] && shopData.cosmeticsEnabled['eyeballs']) {
+            ctx.fillStyle = '#ffffff';
+            ctx.beginPath();
+            ctx.arc(this.x + 10, this.y + 12, 4, 0, Math.PI*2);
+            ctx.arc(this.x + 22, this.y + 12, 4, 0, Math.PI*2);
+            ctx.fill();
+            ctx.fillStyle = '#000000';
+            ctx.beginPath();
+            ctx.arc(this.x + 10 + this.facing, this.y + 12, 2, 0, Math.PI*2);
+            ctx.arc(this.x + 22 + this.facing, this.y + 12, 2, 0, Math.PI*2);
+            ctx.fill();
+        }
+
+        if (shopData.cosmeticsOwned['coolshadez'] && shopData.cosmeticsEnabled['coolshadez']) {
+            ctx.fillStyle = '#000000';
+            ctx.fillRect(this.x + 2, this.y + 10, 13, 7);
+            ctx.fillRect(this.x + 17, this.y + 10, 13, 7);
+            ctx.fillRect(this.x + 15, this.y + 12, 2, 3);
+            ctx.fillStyle = '#334155';
+            ctx.fillRect(this.x + 5, this.y + 12, 7, 3);
+            ctx.fillRect(this.x + 20, this.y + 12, 7, 3);
+        }
+
+        if (shopData.cosmeticsOwned['fancy'] && shopData.cosmeticsEnabled['fancy']) {
+            ctx.fillStyle = '#111111';
+            ctx.fillRect(this.x - 4, this.y - 5, this.w + 8, 5);
+            ctx.fillRect(this.x + 5, this.y - 18, 22, 13);
+            ctx.fillStyle = '#334155';
+            ctx.fillRect(this.x + 5, this.y - 7, 22, 3);
+        }
+
+        if (this.freezeTimer > 0) {
+            ctx.fillStyle = 'rgba(0, 223, 255, 0.45)';
+            ctx.fillRect(this.x - 4, this.y - 4, this.w + 8, this.h + 8);
+            ctx.strokeStyle = '#99ffff';
+            ctx.lineWidth = 2;
+            ctx.strokeRect(this.x - 4, this.y - 4, this.w + 8, this.h + 8);
+        } else if (this.slowTimer > 0) {
+            ctx.fillStyle = '#70d6ff';
+            ctx.font = '12px Arial';
+            ctx.fillText('❄️', this.x + this.w/2, this.y - 6);
+        }
+
+        if (this.weapon.hasShield || this.weapon.hasAirShield) {
+            ctx.strokeStyle = this.setType === 'pyro' ? '#ff4500' : this.setType === 'air' ? '#38bdf8' : '#16a34a';
+            ctx.lineWidth = 3;
+            ctx.beginPath();
+            ctx.arc(this.x + this.w/2, this.y + this.h/2, 70, 0, Math.PI * 2);
+            ctx.stroke();
+        }
+
+        if (this.statuses.some(s => s.type === 'burn')) {
+            ctx.fillText('🔥', this.x + this.w/2, this.y - 8);
+        }
+    }
+}
+
+function initArena(from, to, special = null) {
+    gameState = STATE_ARENA;
+    arenaWinner = null;
+    battleTimer = 0;
+
+    const attackerCode = board[from.r][from.c];
+    const defenderCode = board[to.r][to.c];
+
+    const attackerSet = boardSets[from.r][from.c] || 'crit';
+    const defenderSet = boardSets[to.r][to.c] || 'crit';
+
+    combatPending = { from, to, attackerCode, defenderCode, special };
+
+    const p1IsWhite = (p1Side === 'w');
+    const isAttackerP1 = (attackerCode[0] === 'w' && p1IsWhite) || (attackerCode[0] === 'b' && !p1IsWhite);
+
+    const p1Code = isAttackerP1 ? attackerCode : defenderCode;
+    const p2Code = isAttackerP1 ? defenderCode : attackerCode;
+
+    const p1Set = isAttackerP1 ? attackerSet : defenderSet;
+    const p2Set = isAttackerP1 ? defenderSet : attackerSet;
+
+    p1 = new Fighter(80, 200, '#38bdf8', true, p1Code, p1Set);
+    p2 = new Fighter(680, 200, '#f43f5e', false, p2Code, p2Set);
+
+    projectiles = [];
+    floatTexts = [];
+    beams = [];
+    vibrationFields = [];
+
+    const mapData = getMapForFile(to.c);
+    currentMapName = mapData.name;
+    platforms = mapData.platforms;
+}
+
+function updateArena() {
+    if (arenaWinner) {
+        battleTimer++;
+        if (battleTimer > 90) resolveBattleOutcome();
+        return;
+    }
+
+    p1.update(p2);
+    p2.update(p1);
+
+    if (p1.hp <= 0 && p2.hp <= 0) arenaWinner = p1;
+    else if (p1.hp <= 0) arenaWinner = p2;
+    else if (p2.hp <= 0) arenaWinner = p1;
+
+    for (let i = vibrationFields.length - 1; i >= 0; i--) {
+        const vf = vibrationFields[i];
+        vf.life--;
+
+        [p1, p2].forEach(fighter => {
+            if (fighter !== vf.owner) {
+                if (fighter.x + fighter.w > vf.x && fighter.x < vf.x + vf.w &&
+                    fighter.y + fighter.h > vf.y && fighter.y < vf.y + vf.h) {
+                    
+                    const fieldDmg = 10 / 60;
+                    fighter.hp -= fieldDmg;
+                    fighter.tookDamageInArena = true;
+                    if (fighter.isP1) {
+                        stats.damage_taken += fieldDmg;
+                        unlockAchievement('out_of_time');
+                    } else {
+                        stats.damage_given += fieldDmg;
+                    }
+                }
+            }
+        });
+
+        if (vf.life <= 0) vibrationFields.splice(i, 1);
+    }
+
+    for (let i = beams.length - 1; i >= 0; i--) {
+        const b = beams[i];
+        b.duration--;
+        const beamX = b.facing === 1 ? b.owner.x + b.owner.w : 0;
+        let beamW = b.facing === 1 ? canvas.width - beamX : b.owner.x;
+        b.x = beamX;
+
+        platforms.forEach(plat => {
+            if (plat.isSolid && plat.y < 520) {
+                if (b.facing === 1 && plat.x > b.owner.x && plat.x < b.x + beamW) {
+                    beamW = plat.x - beamX;
+                } else if (b.facing === -1 && plat.x + plat.w < b.owner.x && plat.x + plat.w > b.x) {
+                    const endX = plat.x + plat.w;
+                    beamW = b.owner.x - endX;
+                    b.x = endX;
+                }
+            }
+        });
+        b.w = beamW;
+
+        const target = b.owner === p1 ? p2 : p1;
+
+        if (target.x + target.w > b.x && target.x < b.x + b.w &&
+            target.y + target.h > b.y && target.y < b.y + b.h) {
+            const beamDmg = b.dmgRate / 60;
+            target.hp -= beamDmg;
+            target.tookDamageInArena = true;
+
+            if (b.owner === p1) stats.damage_given += beamDmg;
+            else stats.damage_taken += beamDmg;
+
+            if (b.status) target.addStatus(b.status.type, b.status.dmg, b.status.interval, b.owner);
+            if (b.isFrost) target.applyFrostEffect(b.owner);
+            if (b.owner.weapon.lifesteal) {
+                b.owner.hp = Math.min(100, b.owner.hp + (b.owner.weapon.lifesteal / 60));
+            }
+        }
+
+        if (b.duration <= 0) beams.splice(i, 1);
+    }
+
+    for (let i = projectiles.length - 1; i >= 0; i--) {
+        const p = projectiles[i];
+        const target = p.owner === p1 ? p2 : p1;
+
+        if (p.isSineWave) {
+            p.distTraveled += Math.abs(p.vx);
+            p.y = p.baseY + Math.sin(p.distTraveled * 0.08) * 37;
+        }
+
+        if (p.isSoundwaveHoming && target) {
+            const tx = target.x + target.w/2 - p.x;
+            const ty = target.y + target.h/2 - p.y;
+            const dist = Math.hypot(tx, ty);
+
+            if (dist > 140) {
+                const steerX = (tx / dist) * 0.45;
+                const steerY = (ty / dist) * 0.45;
+                p.vx += steerX;
+                p.vy += steerY;
+                const speed = Math.hypot(p.vx, p.vy);
+                if (speed > 8) {
+                    p.vx = (p.vx / speed) * 8;
+                    p.vy = (p.vy / speed) * 8;
+                }
+            }
+        }
+
+        if (p.isWave) {
+            p.waveTimer = (p.waveTimer || 0) + 0.25;
+            p.vy = p.baseVy + Math.sin(p.waveTimer) * 4;
+        }
+
+        if (p.homing && target) {
+            const tx = target.x + target.w/2 - p.x;
+            const ty = target.y + target.h/2 - p.y;
+            const dist = Math.hypot(tx, ty) || 1;
+
+            let steerX = (tx / dist) * 0.45;
+            let steerY = (ty / dist) * 0.45;
+
+            platforms.forEach(plat => {
+                if (plat.isSolid) {
+                    const futureX = p.x + p.vx * 14;
+                    const futureY = p.y + p.vy * 14;
+
+                    if (futureX > plat.x - 20 && futureX < plat.x + plat.w + 20 &&
+                        futureY > plat.y - 20 && futureY < plat.y + plat.h + 20) {
+                        
+                        const cx = plat.x + plat.w / 2;
+                        const cy = plat.y + plat.h / 2;
+                        const avoidX = p.x - cx;
+                        const avoidY = p.y - cy;
+                        const avoidDist = Math.hypot(avoidX, avoidY) || 1;
+
+                        steerX += (avoidX / avoidDist) * 1.1;
+                        steerY += (avoidY / avoidDist) * 1.1;
+                    }
+                }
+            });
+
+            p.vx += steerX;
+            p.vy += steerY;
+
+            const speed = Math.hypot(p.vx, p.vy);
+            if (speed > 7.5) {
+                p.vx = (p.vx / speed) * 7.5;
+                p.vy = (p.vy / speed) * 7.5;
+            }
+        }
+
+        p.x += p.vx;
+        p.y += p.vy;
+
+        let hitCover = false;
+        platforms.forEach(plat => {
+            if (plat.isSolid && plat.y < 520) {
+                if (p.x > plat.x && p.x < plat.x + plat.w &&
+                    p.y > plat.y && p.y < plat.y + plat.h) {
+                    hitCover = true;
+                }
+            }
+        });
+
+        if (hitCover) {
+            if (p.isVibrate) spawnVibrationField(p.x, p.y, p.owner);
+            projectiles.splice(i, 1);
+            continue;
+        }
+
+        if (p.x > target.x && p.x < target.x + target.w &&
+            p.y > target.y && p.y < target.y + target.h) {
+            
+            target.hp -= p.dmg;
+            target.tookDamageInArena = true;
+            playHitSFX();
+
+            if (p.isVibrate) spawnVibrationField(p.x, p.y, p.owner);
+
+            if (p.owner === p1) {
+                stats.damage_given += p.dmg;
+                if (p.isCrit) unlockAchievement('crit_35');
+            } else {
+                stats.damage_taken += p.dmg;
+            }
+
+            if (p.isCrit) floatTexts.push({ text: 'CRIT!', x: target.x + 10, y: target.y - 10, life: 30, color: '#facc15' });
+            if (p.isFrost) target.applyFrostEffect(p.owner);
+
+            if (p.isAir) {
+                unlockAchievement('twist_x');
+                const ampMult = p.isTornado ? 3.0 : 1.0;
+                const hitY = p.y - target.y;
+                const hitDir = p.vx >= 0 ? 1 : -1;
+
+                if (p.owner.isP1) {
+                    if (!target.grounded) {
+                        target.airHitsInAir = (target.airHitsInAir || 0) + 1;
+                        if (target.airHitsInAir >= 2) unlockAchievement('volleyball');
+                    } else {
+                        target.airHitsInAir = 0;
+                    }
+                }
+
+                if (hitY > (target.h * 2 / 3)) {
+                    target.vy = -12 * ampMult;
+                    target.grounded = false;
+                    floatTexts.push({ text: 'LAUNCH UP!', x: target.x, y: target.y - 15, life: 30, color: '#e0f2fe' });
+                } else if (hitY < (target.h / 3)) {
+                    if (target.grounded) {
+                        target.freezeTimer = Math.round(60 * ampMult);
+                        floatTexts.push({ text: 'PINNED!', x: target.x, y: target.y - 15, life: 30, color: '#e0f2fe' });
+                    } else {
+                        target.vy = 12 * ampMult;
+                        floatTexts.push({ text: 'SLAM DOWN!', x: target.x, y: target.y - 15, life: 30, color: '#e0f2fe' });
+                    }
+                } else {
+                    target.vx = hitDir * 12 * ampMult;
+                    target.x += hitDir * 35 * ampMult;
+                    floatTexts.push({ text: 'WIND BURST!', x: target.x, y: target.y - 15, life: 30, color: '#e0f2fe' });
+                }
+            }
+
+            if (p.lifesteal) {
+                p.owner.hp = Math.min(100, p.owner.hp + p.lifesteal);
+                floatTexts.push({ text: `+${p.lifesteal} HP`, x: p.owner.x + 10, y: p.owner.y - 10, life: 30, color: '#22c55e' });
+            }
+
+            if (p.status) target.addStatus(p.status.type, p.status.dmg, p.status.interval, p.owner);
+
+            projectiles.splice(i, 1);
+            if (target.hp <= 0) {
+                target.hp = 0;
+                arenaWinner = p.owner;
+            }
+            continue;
+        }
+
+        if (p.x < 0 || p.x > canvas.width || p.y < 0 || p.y > canvas.height) {
+            projectiles.splice(i, 1);
+        }
+    }
+
+    for (let i = floatTexts.length - 1; i >= 0; i--) {
+        const ft = floatTexts[i];
+        ft.y -= 0.8;
+        ft.life--;
+        if (ft.life <= 0) floatTexts.splice(i, 1);
+    }
+}
+
+function resolveBattleOutcome() {
+    const { from, to, attackerCode, defenderCode, special } = combatPending;
+    const attackerColor = attackerCode[0];
+    const winningColor = arenaWinner === p1 ? (p1Side === 'w' ? 'w' : 'b') : (p1Side === 'w' ? 'b' : 'w');
+
+    const p1IsAttacker = (attackerCode[0] === 'w' && p1Side === 'w') || (attackerCode[0] === 'b' && p1Side === 'b');
+    const p1PieceCode = p1IsAttacker ? attackerCode : defenderCode;
+    const oppPieceCode = p1IsAttacker ? defenderCode : attackerCode;
+
+    if (arenaWinner === p1) {
+        stats.pieces_taken++;
+        matchP1PiecesTaken++;
+        matchKillStreak++;
+        addCurrency(50); // Golden rooks per piece taken
+
+        if (!p1.tookDamageInArena) unlockAchievement('matrix');
+        if (matchKillStreak >= 5) unlockAchievement('kill_streak');
+
+        if (p1RookLostLastTurn) {
+            unlockAchievement('sacrifice_rook');
+            p1RookLostLastTurn = false;
+        }
+
+        if (p1KnightLostLastTurn) {
+            unlockAchievement('dead_eli');
+            p1KnightLostLastTurn = false;
+        }
+
+        if (p1PieceCode[2] === 'p' && oppPieceCode[2] === 'k') unlockAchievement('goat');
+    } else {
+        stats.pieces_lost++;
+        matchP1PiecesLost++;
+        matchKillStreak = 0;
+
+        if (p1PieceCode[2] === 'r') p1RookLostLastTurn = true;
+        else p1RookLostLastTurn = false;
+
+        if (p1PieceCode[2] === 'n') p1KnightLostLastTurn = true;
+        else p1KnightLostLastTurn = false;
+
+        if (p1PieceCode[2] === 'q' && oppPieceCode[2] === 'p') unlockAchievement('queen_sac');
+    }
+    saveStats();
+
+    if (attackerColor === winningColor) {
+        const destination = special && special.enPassant ? special.destination : to;
+        board[destination.r][destination.c] = attackerCode;
+        board[from.r][from.c] = null;
+        boardSets[destination.r][destination.c] = boardSets[from.r][from.c];
+        boardSets[from.r][from.c] = null;
+        if (special && special.enPassant) {
+            board[to.r][to.c] = null;
+            boardSets[to.r][to.c] = null;
+
+            // En Passant achievement: only award it for a successful P1 capture.
+            if (attackerColor === p1Side && arenaWinner === p1) {
+                unlockAchievement('en_passant');
+            }
+        }
+        updateCastlingRightsAfterMove(attackerCode, from.r, from.c, destination.r, destination.c, defenderCode);
+        lastChessMove = { from: { ...from }, to: { ...destination }, piece: attackerCode, enPassant: !!(special && special.enPassant) };
+        if (isPromotionSquare(destination.r, attackerCode[0]) && attackerCode[2] === 'p') {
+            pendingPromotion = { r: destination.r, c: destination.c, color: attackerCode[0] };
+            promotePiece(destination.r, destination.c, attackerCode[0], attackerCode[0] === p1Side);
+        }
+
+        if (defenderCode[2] === 'k') {
+            const oppColor = p1Side === 'w' ? 'b' : 'w';
+            let oppRemainingNonKing = 0;
+            for (let r = 0; r < 8; r++) {
+                for (let c = 0; c < 8; c++) {
+                    if (board[r][c] && board[r][c][0] === oppColor && board[r][c][2] !== 'k') {
+                        oppRemainingNonKing++;
+                    }
+                }
+            }
+            if (oppRemainingNonKing === 0 && winningColor === p1Side) unlockAchievement('total_war');
+            triggerGameVictory(attackerColor);
+        }
+    } else {
+        board[from.r][from.c] = null;
+        boardSets[from.r][from.c] = null;
+        if (attackerCode[2] === 'k') triggerGameVictory(winningColor);
+    }
+
+    let p1PiecesCount = 0;
+    let p1OnlyKing = true;
+    for (let r = 0; r < 8; r++) {
+        for (let c = 0; c < 8; c++) {
+            if (board[r][c] && board[r][c][0] === p1Side) {
+                p1PiecesCount++;
+                if (board[r][c][2] !== 'k') p1OnlyKing = false;
+            }
+        }
+    }
+    if (p1PiecesCount === 1 && p1OnlyKing) unlockAchievement('lone_soldier');
+
+    turn = turn === 'w' ? 'b' : 'w';
+    if (turn === p1Side) p1TurnStartTime = Date.now();
+    selectedSquare = null;
+    if (gameState !== STATE_VICTORY) gameState = STATE_CHESS;
+}
+
+function triggerGameVictory(winningColor) {
+    gameState = STATE_VICTORY;
+    const p1IsWinningColor = (winningColor === p1Side);
+    gameWinner = p1IsWinningColor ? p1Name.toUpperCase() : (vsBot ? `${BOT_DIFFICULTIES[botDifficultyIdx]} BOT` : p2Name.toUpperCase());
+    
+    unlockAchievement('new_commander');
+
+    if (matchAchievementsEarned === 0) unlockAchievement('logan');
+
+    let remainingRooks = 0;
+    for (let r = 0; r < 8; r++) {
+        for (let c = 0; c < 8; c++) {
+            if (board[r][c] && board[r][c][2] === 'r') remainingRooks++;
+        }
+    }
+    if (remainingRooks === 0) unlockAchievement('sad_michael');
+
+    if (p1IsWinningColor) {
+        addCurrency(500); // 500 Golden Rooks for winning
+        if (!vsBot) unlockAchievement('friendship_destroyer');
+
+        stats.wins++;
+        if (vsBot) {
+            const diffName = BOT_DIFFICULTIES[botDifficultyIdx];
+            stats.bot_wins[diffName] = (stats.bot_wins[diffName] || 0) + 1;
+
+            if (botDifficultyIdx >= 1) {
+                stats.sets_won_med = stats.sets_won_med || {};
+                stats.sets_won_med[p1SelectedSet] = true;
+
+                const baseSets = ['crit', 'air', 'frost', 'pyro', 'vampire', 'soundwave', 'random'];
+                if (baseSets.every(s => stats.sets_won_med[s])) unlockAchievement('jack_of_all_trades');
+            }
+
+            if (p1SelectedSet === 'soundwave') {
+                stats.soundwave_beat_sets = stats.soundwave_beat_sets || {};
+                stats.soundwave_beat_sets[p2SelectedSet] = true;
+                const baseSets = ['crit', 'air', 'frost', 'pyro', 'vampire', 'soundwave', 'random'];
+                if (baseSets.every(s => stats.soundwave_beat_sets[s])) unlockAchievement('happy_michael');
+            }
+
+            if (stats.bot_wins['EASY'] >= 1 && stats.bot_wins['MEDIUM'] >= 1 && stats.bot_wins['HARD'] >= 1 && stats.bot_wins['AI OVERLORD'] >= 1) {
+                unlockAchievement('bot_battler');
+            }
+
+            if (stats.bot_wins['EASY'] >= 5 && stats.bot_wins['MEDIUM'] >= 5 && stats.bot_wins['HARD'] >= 5 && stats.bot_wins['AI OVERLORD'] >= 5) {
+                unlockAchievement('chess_master');
+            }
+
+            if (botDifficultyIdx >= 2 && p2SelectedSet === 'air') unlockAchievement('reed_timer');
+        }
+
+        if (p1SelectedSet === 'pyro') unlockAchievement('arsonist');
+        if (p1SelectedSet === 'vampire') unlockAchievement('dracula');
+        if (p1SelectedSet === 'frost') unlockAchievement('snowman');
+        if (p1SelectedSet === 'air') unlockAchievement('avatar');
+        if (p1SelectedSet === 'soundwave') unlockAchievement('director');
+        if (p1SelectedSet === 'random') unlockAchievement('gambler');
+        if (p1SelectedSet === 'crit') unlockAchievement('lucky');
+        if (p1SelectedSet === 'custom') unlockAchievement('frankenstein');
+
+        if (p1MovedOnlyKnights && p1MoveCount > 0) unlockAchievement('eli_ethan');
+        if (p1MoveCount < 4) unlockAchievement('scholars_mate');
+        if (totalChessMoves >= 35) unlockAchievement('wait_thats_how');
+        if (matchP1PiecesTaken === 1) unlockAchievement('surgeon');
+        if (matchP1PiecesLost === 0) unlockAchievement('perfectionist');
+    } else {
+        addCurrency(100);
+        stats.losses++;
+        if (vsBot) {
+            unlockAchievement('the_future');
+            const diffName = BOT_DIFFICULTIES[botDifficultyIdx];
+            stats.bot_losses = stats.bot_losses || { 'EASY': 0, 'MEDIUM': 0, 'HARD': 0, 'AI OVERLORD': 0 };
+            stats.bot_losses[diffName] = (stats.bot_losses[diffName] || 0) + 1;
+
+            if (stats.bot_losses['EASY'] >= 1 && stats.bot_losses['MEDIUM'] >= 1 && stats.bot_losses['HARD'] >= 1 && stats.bot_losses['AI OVERLORD'] >= 1) {
+                unlockAchievement('skill_issue');
+            }
+        }
+    }
+
+    saveStats();
+
+    if (vsBot && botDifficultyIdx === 3 && p1IsWinningColor) {
+        if (p1Side === 'w') {
+            unlockedCustomW = true;
+            localStorage.setItem('bc_custom_w', 'true');
+        } else {
+            unlockedCustomB = true;
+            localStorage.setItem('bc_custom_b', 'true');
+        }
+        playAxelFMelody();
+    }
+
+    yummySecretActive = false;
+}
+
+function drawMenu() {
+    ctx.fillStyle = '#0f172a';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    ctx.fillStyle = '#38bdf8';
+    ctx.font = 'bold 42px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText('⚔️ BATTLE CHESS ⚔️', canvas.width / 2, 100);
+
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '16px Arial';
+    ctx.fillText('Select your game mode', canvas.width / 2, 145);
+
+    // Currency HUD
+    drawGoldenRookIcon(25, 20, 24);
+    ctx.fillStyle = '#ffd700';
+    ctx.font = 'bold 20px Arial';
+    ctx.textAlign = 'left';
+    ctx.fillText(`$${stats.golden_rooks.toLocaleString()}`, 58, 40);
+
+    // Play Time Display
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '14px Arial';
+    ctx.textAlign = 'right';
+    const hours = (stats.play_time / 3600).toFixed(1);
+    ctx.fillText(`⏱️ Time Played: ${hours} hrs`, 780, 40);
+
+    ctx.textAlign = 'center';
+
+    ctx.fillStyle = '#0284c7';
+    ctx.fillRect(250, 210, 300, 42);
+    ctx.strokeStyle = '#38bdf8';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(250, 210, 300, 42);
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 15px Arial';
+    ctx.fillText(`1- QUICK PLAY BOT`, canvas.width / 2, 236);
+
+    ctx.fillStyle = '#7c3aed';
+    ctx.fillRect(250, 265, 300, 42);
+    ctx.strokeStyle = '#a855f7';
+    ctx.strokeRect(250, 265, 300, 42);
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText('2- CUSTOM MATCH', canvas.width / 2, 291);
+
+    ctx.fillStyle = '#eab308';
+    ctx.fillRect(250, 320, 300, 42);
+    ctx.strokeStyle = '#fde047';
+    ctx.strokeRect(250, 320, 300, 42);
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText('🛒 SHOP', canvas.width / 2, 346);
+
+    ctx.fillStyle = '#16a34a';
+    ctx.fillRect(250, 375, 300, 42);
+    ctx.strokeStyle = '#22c55e';
+    ctx.strokeRect(250, 375, 300, 42);
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText('📊 ACHIEVEMENTS & STATS', canvas.width / 2, 401);
+
+    ctx.fillStyle = '#334155';
+    ctx.fillRect(250, 430, 300, 42);
+    ctx.strokeStyle = '#64748b';
+    ctx.strokeRect(250, 430, 300, 42);
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText('📜 UPDATE LOG', canvas.width / 2, 456);
+
+    ctx.fillStyle = '#1e293b';
+    ctx.fillRect(20, 540, 45, 45);
+    ctx.strokeStyle = '#475569';
+    ctx.strokeRect(20, 540, 45, 45);
+    ctx.fillStyle = '#f8fafc';
+    ctx.font = '22px Arial';
+    ctx.fillText('⚙️', 42, 570);
+
+    ctx.fillStyle = yummySecretActive ? '#f97316' : '#475569';
+    ctx.font = '12px Arial';
+    ctx.textAlign = 'right';
+    ctx.fillText('yummystuff interactive', 790, 580);
+}
+
+function drawShop() {
+    ctx.fillStyle = '#0f172a';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    ctx.fillStyle = '#ffd700';
+    ctx.font = 'bold 36px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText('🛒 MAIN MENU SHOP', canvas.width / 2, 50);
+
+    drawGoldenRookIcon(640, 20, 24);
+    ctx.fillStyle = '#ffd700';
+    ctx.font = 'bold 20px Arial';
+    ctx.textAlign = 'left';
+    ctx.fillText(`$${stats.golden_rooks.toLocaleString()}`, 675, 40);
+
+    // Tabs
+    const tabs = ['PIECES', 'COSMETIC', 'CONSUMABLES'];
+    tabs.forEach((t, idx) => {
+        const tx = 50 + idx * 240;
+        const isActive = shopTab === t;
+        ctx.fillStyle = isActive ? '#0284c7' : '#1e293b';
+        ctx.fillRect(tx, 70, 220, 35);
+        ctx.strokeStyle = isActive ? '#38bdf8' : '#334155';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(tx, 70, 220, 35);
+        ctx.fillStyle = '#ffffff';
+        ctx.font = 'bold 15px Arial';
+        ctx.textAlign = 'center';
+        ctx.fillText(t, tx + 110, 93);
+    });
+
+    if (shopTab === 'PIECES') {
+        const keysList = ['air', 'frost', 'soundwave', 'pyro', 'vampire', 'random'];
+        keysList.forEach((k, idx) => {
+            const set = CHESS_SETS[k];
+            const itemY = 125 + idx * 58;
+            ctx.fillStyle = '#1e293b';
+            ctx.fillRect(50, itemY, 700, 50);
+            ctx.strokeStyle = '#334155';
+            ctx.strokeRect(50, itemY, 700, 50);
+
+            ctx.fillStyle = '#38bdf8';
+            ctx.font = 'bold 18px Arial';
+            ctx.textAlign = 'left';
+            ctx.fillText(set.name, 70, itemY + 24);
+
+            ctx.fillStyle = '#ffd700';
+            ctx.font = 'bold 16px Arial';
+            ctx.fillText(`$${set.price}`, 280, itemY + 24);
+
+            ctx.fillStyle = '#94a3b8';
+            ctx.font = '12px Arial';
+            ctx.fillText(set.desc.substring(0, 45) + '...', 70, itemY + 42);
+
+            const isUnlocked = shopData.unlockedSets[k];
+            ctx.fillStyle = isUnlocked ? '#16a34a' : '#0284c7';
+            ctx.fillRect(550, itemY + 8, 180, 34);
+            ctx.fillStyle = '#ffffff';
+            ctx.font = 'bold 14px Arial';
+            ctx.textAlign = 'center';
+            ctx.fillText(isUnlocked ? 'UNLOCKED' : `BUY $${set.price}`, 640, itemY + 30);
+        });
+    } else if (shopTab === 'COSMETIC') {
+        const cosmetics = [
+            { id: 'eyeballs', name: 'Eye balls', price: 5000, desc: 'Adds googly eye balls to all your chess pieces' },
+            { id: 'coolshadez', name: 'Cool shadez', price: 5000, desc: 'Adds cool pixel shades to all your pieces' },
+            { id: 'goldenboard', name: 'Golden board', price: 5000, desc: 'Makes your chess board majestic golden' },
+            { id: 'diamondboard', name: 'Diamond', price: 7200, desc: 'Makes your chess board shiny diamond cyan' },
+            { id: 'fancy', name: 'Fancy', price: 7200, desc: 'Adds classy top hats to all your chess pieces' }
+        ];
+
+        cosmetics.forEach((item, idx) => {
+            const itemY = 125 + idx * 68;
+            ctx.fillStyle = '#1e293b';
+            ctx.fillRect(50, itemY, 700, 58);
+            ctx.strokeStyle = '#334155';
+            ctx.strokeRect(50, itemY, 700, 58);
+
+            ctx.fillStyle = '#a855f7';
+            ctx.font = 'bold 18px Arial';
+            ctx.textAlign = 'left';
+            ctx.fillText(item.name, 70, itemY + 26);
+
+            ctx.fillStyle = '#ffd700';
+            ctx.font = 'bold 16px Arial';
+            ctx.fillText(`$${item.price}`, 280, itemY + 26);
+
+            ctx.fillStyle = '#94a3b8';
+            ctx.font = '12px Arial';
+            ctx.fillText(item.desc, 70, itemY + 46);
+
+            const owned = shopData.cosmeticsOwned[item.id];
+            const enabled = shopData.cosmeticsEnabled[item.id];
+
+            ctx.fillStyle = !owned ? '#0284c7' : (enabled ? '#16a34a' : '#dc2626');
+            ctx.fillRect(550, itemY + 12, 180, 36);
+            ctx.fillStyle = '#ffffff';
+            ctx.font = 'bold 14px Arial';
+            ctx.textAlign = 'center';
+            
+            let btnText = `BUY $${item.price}`;
+            if (owned) btnText = enabled ? 'ENABLED' : 'DISABLED';
+            ctx.fillText(btnText, 640, itemY + 35);
+        });
+    } else if (shopTab === 'CONSUMABLES') {
+        const items = [
+            { name: 'Sneeze', price: 200, desc: 'Undo 1 move/battle in a match. Removes stats gained during that move.', count: shopData.sneezesCount || 0 },
+            { name: 'Achievement hint', price: 750, desc: 'Tells how to get a random un-achieved achievement.', count: null },
+            { name: 'Donation $1', price: 1, desc: 'Donate to the developer. Does nothing except show love!', count: null }
+        ];
+
+        items.forEach((item, idx) => {
+            const itemY = 125 + idx * 70;
+            ctx.fillStyle = '#1e293b';
+            ctx.fillRect(50, itemY, 700, 60);
+            ctx.strokeStyle = '#334155';
+            ctx.strokeRect(50, itemY, 700, 60);
+
+            ctx.fillStyle = '#38bdf8';
+            ctx.font = 'bold 18px Arial';
+            ctx.textAlign = 'left';
+            const extra = item.count !== null ? ` (Owned: ${item.count})` : '';
+            ctx.fillText(item.name + extra, 70, itemY + 26);
+
+            ctx.fillStyle = '#ffd700';
+            ctx.font = 'bold 16px Arial';
+            ctx.fillText(`$${item.price}`, 340, itemY + 26);
+
+            ctx.fillStyle = '#94a3b8';
+            ctx.font = '12px Arial';
+            ctx.fillText(item.desc, 70, itemY + 48);
+
+            ctx.fillStyle = '#0284c7';
+            ctx.fillRect(550, itemY + 10, 180, 36);
+            ctx.fillStyle = '#ffffff';
+            ctx.font = 'bold 14px Arial';
+            ctx.textAlign = 'center';
+            ctx.fillText(`BUY $${item.price}`, 640, itemY + 33);
+        });
+    }
+
+    if (shopMessage) {
+        ctx.fillStyle = '#facc15';
+        ctx.font = 'bold 15px Arial';
+        ctx.textAlign = 'center';
+        ctx.fillText(shopMessage, canvas.width / 2, 500);
+    }
+
+    ctx.fillStyle = '#475569';
+    ctx.fillRect(300, 530, 200, 45);
+    ctx.strokeStyle = '#64748b';
+    ctx.strokeRect(300, 530, 200, 45);
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 16px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText('MAIN MENU', 400, 558);
+}
+
+function drawSettings() {
+    ctx.fillStyle = '#0f172a';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    ctx.fillStyle = '#38bdf8';
+    ctx.font = 'bold 36px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText('⚙️ SETTINGS', canvas.width / 2, 60);
+
+    ctx.fillStyle = soundMuted ? '#ef4444' : '#22c55e';
+    ctx.fillRect(250, 100, 300, 40);
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(250, 100, 300, 40);
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 16px Arial';
+    ctx.fillText(soundMuted ? 'SOUND: MUTED' : 'SOUND: ENABLED', 400, 125);
+
+    ctx.fillStyle = '#38bdf8';
+    ctx.font = 'bold 18px Arial';
+    ctx.fillText('Player 1 Controls', 200, 185);
+
+    const p1Actions = ['jump', 'left', 'right', 'attack'];
+    p1Actions.forEach((act, idx) => {
+        const bx = 100 + (idx % 2) * 160;
+        const by = 210 + Math.floor(idx / 2) * 45;
+        const isRebinding = rebindingKey && rebindingKey.player === 1 && rebindingKey.action === act;
+
+        ctx.fillStyle = isRebinding ? '#eab308' : '#334155';
+        ctx.fillRect(bx, by, 140, 35);
+        ctx.strokeStyle = '#64748b';
+        ctx.strokeRect(bx, by, 140, 35);
+        ctx.fillStyle = '#ffffff';
+        ctx.font = '13px Arial';
+        const keyName = formatKeyName(p1Keys[act]);
+        ctx.fillText(`${act.toUpperCase()}: ${isRebinding ? 'PRESS...' : keyName}`, bx + 70, by + 22);
+    });
+
+    ctx.fillStyle = '#f43f5e';
+    ctx.font = 'bold 18px Arial';
+    ctx.fillText('Player 2 Controls', 560, 185);
+
+    const p2Actions = ['jump', 'left', 'right', 'attack'];
+    p2Actions.forEach((act, idx) => {
+        const bx = 460 + (idx % 2) * 160;
+        const by = 210 + Math.floor(idx / 2) * 45;
+        const isRebinding = rebindingKey && rebindingKey.player === 2 && rebindingKey.action === act;
+
+        ctx.fillStyle = isRebinding ? '#eab308' : '#334155';
+        ctx.fillRect(bx, by, 140, 35);
+        ctx.strokeStyle = '#64748b';
+        ctx.strokeRect(bx, by, 140, 35);
+        ctx.fillStyle = '#ffffff';
+        ctx.font = '13px Arial';
+        const keyName = formatKeyName(p2Keys[act]);
+        ctx.fillText(`${act.toUpperCase()}: ${isRebinding ? 'PRESS...' : keyName}`, bx + 70, by + 22);
+    });
+
+    ctx.fillStyle = '#dc2626';
+    ctx.fillRect(250, 410, 300, 45);
+    ctx.strokeStyle = '#f87171';
+    ctx.strokeRect(250, 410, 300, 45);
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 15px Arial';
+    ctx.fillText('RESET ALL STATS & DATA', 400, 437);
+
+    ctx.fillStyle = '#475569';
+    ctx.fillRect(300, 520, 200, 45);
+    ctx.strokeStyle = '#64748b';
+    ctx.strokeRect(300, 520, 200, 45);
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 16px Arial';
+    ctx.fillText('MAIN MENU', 400, 548);
+}
+
+function drawStats() {
+    ctx.fillStyle = '#0f172a';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    ctx.fillStyle = '#38bdf8';
+    ctx.font = 'bold 30px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText('📊 STATS & ACHIEVEMENTS', canvas.width / 2, 45);
+
+    // Left Panel: Stats
+    ctx.fillStyle = '#1e293b';
+    ctx.fillRect(30, 70, 320, 440);
+    ctx.strokeStyle = '#334155';
+    ctx.strokeRect(30, 70, 320, 440);
+
+    ctx.fillStyle = '#f8fafc';
+    ctx.font = 'bold 18px Arial';
+    ctx.textAlign = 'left';
+    ctx.fillText('Career Stats', 50, 100);
+
+    ctx.font = '13px Arial';
+    ctx.fillStyle = '#94a3b8';
+    let statY = 130;
+    const hrs = (stats.play_time / 3600).toFixed(2);
+    const statLines = [
+        `Time Played: ${hrs} Hours`,
+        `Golden Rooks: $${stats.golden_rooks.toLocaleString()}`,
+        `Total Matches Won: ${stats.wins}`,
+        `Total Matches Lost: ${stats.losses}`,
+        `Pieces Taken: ${stats.pieces_taken}`,
+        `Pieces Lost: ${stats.pieces_lost}`,
+        `Jumps Executed: ${stats.jumps}`,
+        `Shots Fired: ${stats.shots}`,
+        `Damage Dealt: ${Math.round(stats.damage_given)}`,
+        `Damage Taken: ${Math.round(stats.damage_taken)}`,
+        `Distance Traveled: ${Math.round(stats.distance_traveled)} px`,
+        `Bot Wins (Easy/Med/Hard/Overlord):`,
+        `  ${stats.bot_wins['EASY']}/${stats.bot_wins['MEDIUM']}/${stats.bot_wins['HARD']}/${stats.bot_wins['AI OVERLORD']}`
+    ];
+
+    statLines.forEach(line => {
+        ctx.fillText(line, 50, statY);
+        statY += 25;
+    });
+
+    // Right Panel: Achievements List
+    ctx.fillStyle = '#1e293b';
+    ctx.fillRect(380, 70, 390, 440);
+    ctx.strokeStyle = '#334155';
+    ctx.strokeRect(380, 70, 390, 440);
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(380, 70, 390, 440);
+    ctx.clip();
+
+    let achY = 85 - achievementsScrollY;
+    const unlockedCount = Object.keys(achievements).filter(k => achievements[k]).length;
+
+    ctx.fillStyle = '#f8fafc';
+    ctx.font = 'bold 16px Arial';
+    ctx.fillText(`Achievements (${unlockedCount}/${ACHIEVEMENT_LIST.length})`, 400, achY + 15);
+    achY += 35;
+
+    ACHIEVEMENT_LIST.forEach(ach => {
+        const isUnlocked = achievements[ach.id];
+        ctx.fillStyle = isUnlocked ? 'rgba(34, 197, 94, 0.15)' : 'rgba(255, 255, 255, 0.03)';
+        ctx.fillRect(390, achY, 370, 58);
+        ctx.strokeStyle = isUnlocked ? '#22c55e' : '#475569';
+        ctx.strokeRect(390, achY, 370, 58);
+
+        ctx.fillStyle = isUnlocked ? '#22c55e' : '#64748b';
+        ctx.font = 'bold 15px Arial';
+        ctx.fillText((isUnlocked ? '🏆 ' : '🔒 ') + ach.name, 400, achY + 22);
+
+        ctx.fillStyle = isUnlocked ? '#cbd5e1' : '#475569';
+        ctx.font = '12px Arial';
+        const displayDesc = (!isUnlocked && ach.secret) ? '?? Secret Achievement ??' : ach.desc;
+        ctx.fillText(displayDesc, 400, achY + 42);
+
+        achY += 66;
+    });
+
+    ctx.restore();
+
+    ctx.fillStyle = '#475569';
+    ctx.fillRect(300, 530, 200, 45);
+    ctx.strokeStyle = '#64748b';
+    ctx.strokeRect(300, 530, 200, 45);
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 16px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText('MAIN MENU', 400, 558);
+}
+
+function drawLog() {
+    ctx.fillStyle = '#0f172a';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    ctx.fillStyle = '#38bdf8';
+    ctx.font = 'bold 32px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText('📜 UPDATE LOG', canvas.width / 2, 45);
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(80, 65, 640, 440);
+    ctx.clip();
+
+    ctx.textAlign = 'left';
+    ctx.font = '14px Arial';
+
+    const updates = [
+        "1.0 Chess but with battles",
+        "1.2 New pyro and vampire set",
+        "1.3 Added bot with 4 difficulty settings",
+        "1.4 Bot nerfed+ballenceing",
+        "1.5 Added map’s depending on which file",
+        "1.6 Fixed maps+added random chess set",
+        "1.7 Fixed maps+Rook buffed+added ???+Added update log",
+        "1.9 8-bit audio+Custom set+Side switching+Player names",
+        "2.0 Achivments and stats added",
+        "2.1 Frost set",
+        "2.2 Air set",
+        "2.3 Soundwave set",
+        "2.4 Shop with cosmetics+chess sets+consumables and new persistent stat “Time”",
+        "Patch I 2.4 Added castling+promotion+en passant and fixed chess board cosmetics",
+        "Patch I 2.4 Fixed chess piece side outlines + en passant achievement"
+    ];
+
+    let logY = 85 - logScrollY;
+    updates.forEach((item) => {
+        ctx.fillStyle = '#1e293b';
+        ctx.fillRect(100, logY, 600, 34);
+        ctx.strokeStyle = '#334155';
+        ctx.strokeRect(100, logY, 600, 34);
+
+        ctx.fillStyle = '#38bdf8';
+        ctx.fillText(item, 115, logY + 22);
+        logY += 40;
+    });
+
+    ctx.restore();
+
+    ctx.fillStyle = '#475569';
+    ctx.fillRect(300, 520, 200, 45);
+    ctx.strokeStyle = '#64748b';
+    ctx.strokeRect(300, 520, 200, 45);
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 16px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText('MAIN MENU', 400, 548);
+}
+
+function drawSetup() {
+    ctx.fillStyle = '#0f172a';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    ctx.fillStyle = '#38bdf8';
+    ctx.font = 'bold 28px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText('MATCH SETUP', canvas.width / 2, 35);
+
+    ctx.fillStyle = '#1e293b';
+    ctx.fillRect(280, 50, 240, 35);
+    ctx.strokeStyle = '#38bdf8';
+    ctx.strokeRect(280, 50, 240, 35);
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 14px Arial';
+    ctx.fillText(`MODE: ${vsBot ? 'VS BOT 🤖' : 'VS PLAYER 👥'}`, 400, 72);
+
+    if (vsBot) {
+        ctx.fillStyle = '#1e293b';
+        ctx.fillRect(280, 92, 240, 35);
+        ctx.strokeStyle = '#a855f7';
+        ctx.strokeRect(280, 92, 240, 35);
+        ctx.fillStyle = '#a855f7';
+        ctx.font = 'bold 14px Arial';
+        ctx.fillText(`BOT: ${BOT_DIFFICULTIES[botDifficultyIdx]}`, 400, 114);
+    }
+
+    ctx.fillStyle = '#1e293b';
+    ctx.fillRect(280, 134, 240, 35);
+    ctx.strokeStyle = '#eab308';
+    ctx.strokeRect(280, 134, 240, 35);
+    ctx.fillStyle = '#eab308';
+    ctx.font = 'bold 14px Arial';
+    ctx.fillText(`P1 COLOR: ${p1Side === 'w' ? 'WHITE ♔' : 'BLACK ♚'}`, 400, 156);
+
+    // Player 1 Set Selection
+    ctx.fillStyle = '#38bdf8';
+    ctx.font = 'bold 18px Arial';
+    ctx.fillText(`${p1Name} (P1)`, 210, 130);
+
+    const availableP1Sets = Object.keys(CHESS_SETS).filter(k => k !== 'custom' && shopData.unlockedSets[k]);
+    const p1CanCustom = (p1Side === 'w' && unlockedCustomW) || (p1Side === 'b' && unlockedCustomB);
+    if (p1CanCustom) availableP1Sets.push('custom');
+
+    availableP1Sets.forEach((key, idx) => {
+        const btnY = 175 + idx * 34;
+        const set = CHESS_SETS[key];
+        const isSelected = p1SelectedSet === key;
+
+        ctx.fillStyle = isSelected ? '#0284c7' : '#1e293b';
+        ctx.fillRect(80, btnY, 260, 30);
+        ctx.strokeStyle = isSelected ? '#38bdf8' : '#334155';
+        ctx.strokeRect(80, btnY, 260, 30);
+        ctx.fillStyle = '#ffffff';
+        ctx.font = 'bold 13px Arial';
+        ctx.fillText(set.name, 210, btnY + 20);
+    });
+
+    // Player 2 Set Selection
+    ctx.fillStyle = '#f43f5e';
+    ctx.font = 'bold 18px Arial';
+    ctx.fillText(`${vsBot ? 'Bot' : p2Name} (P2)`, 590, 130);
+
+    const availableP2Sets = Object.keys(CHESS_SETS).filter(k => k !== 'custom' && shopData.unlockedSets[k]);
+    const p2Side = p1Side === 'w' ? 'b' : 'w';
+    const p2CanCustom = (p2Side === 'w' && unlockedCustomW) || (p2Side === 'b' && unlockedCustomB);
+    if (p2CanCustom) availableP2Sets.push('custom');
+
+    availableP2Sets.forEach((key, idx) => {
+        const btnY = 175 + idx * 34;
+        const set = CHESS_SETS[key];
+        const isSelected = p2SelectedSet === key;
+
+        ctx.fillStyle = isSelected ? '#be123c' : '#1e293b';
+        ctx.fillRect(460, btnY, 260, 30);
+        ctx.strokeStyle = isSelected ? '#f43f5e' : '#334155';
+        ctx.strokeRect(460, btnY, 260, 30);
+        ctx.fillStyle = '#ffffff';
+        ctx.font = 'bold 13px Arial';
+        ctx.fillText(set.name, 590, btnY + 20);
+    });
+
+    // START GAME Button
+    ctx.fillStyle = '#16a34a';
+    ctx.fillRect(280, 525, 240, 40);
+    ctx.strokeStyle = '#22c55e';
+    ctx.strokeRect(280, 525, 240, 40);
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 18px Arial';
+    ctx.fillText('START BATTLE ⚔️', 400, 551);
+}
+
+function drawCustomSetup() {
+    ctx.fillStyle = '#0f172a';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    ctx.fillStyle = '#38bdf8';
+    ctx.font = 'bold 28px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText(`CUSTOM SET CONFIGURATOR (${activeEditingPlayer === 1 ? p1Name : p2Name})`, canvas.width / 2, 45);
+
+    const startX = 160;
+    const startY = 120;
+    const tileSize = 60;
+    const pIsWhite = (activeEditingPlayer === 1 && p1Side === 'w') || (activeEditingPlayer === 2 && p1Side === 'b');
+    const activeGrid = activeEditingPlayer === 1 ? p1CustomGrid : p2CustomGrid;
+
+    const rowsToEdit = pIsWhite ? [6, 7] : [0, 1];
+
+    rowsToEdit.forEach((r, rIdx) => {
+        for (let c = 0; c < 8; c++) {
+            const x = startX + c * tileSize;
+            const y = startY + rIdx * tileSize * 2;
+            const setKey = activeGrid[r][c] || 'crit';
+
+            ctx.fillStyle = (r + c) % 2 === 0 ? '#cbd5e1' : '#475569';
+            ctx.fillRect(x, y, tileSize, tileSize);
+
+            const pieceCode = pIsWhite ? (r === 6 ? 'w_p' : board[7][c]) : (r === 1 ? 'b_p' : board[0][c]);
+            ctx.fillStyle = '#000000';
+            ctx.font = '32px Arial';
+            ctx.fillText(PIECE_SYMBOLS[pieceCode] || '♟', x + tileSize / 2, y + 42);
+
+            ctx.fillStyle = '#1e293b';
+            ctx.fillRect(x, y + tileSize, tileSize, 24);
+            ctx.fillStyle = '#38bdf8';
+            ctx.font = 'bold 10px Arial';
+            ctx.fillText(setKey.toUpperCase(), x + tileSize / 2, y + tileSize + 16);
+        }
+    });
+
+    ctx.fillStyle = '#16a34a';
+    ctx.fillRect(300, 500, 200, 45);
+    ctx.strokeStyle = '#22c55e';
+    ctx.strokeRect(300, 500, 200, 45);
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 16px Arial';
+    ctx.fillText('CONFIRM SET', 400, 528);
+}
+
+function drawChess() {
+    ctx.fillStyle = '#0f172a';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    ctx.fillStyle = turn === 'w' ? '#38bdf8' : '#f43f5e';
+    ctx.font = 'bold 22px Arial';
+    ctx.textAlign = 'center';
+    const turnText = turn === 'w' ? (p1Side === 'w' ? p1Name : p2Name) : (p1Side === 'b' ? p1Name : p2Name);
+    ctx.fillText(`TURN: ${turnText.toUpperCase()} (${turn === 'w' ? 'WHITE' : 'BLACK'})`, canvas.width / 2, 35);
+
+    // Board rendering with cosmetics
+    const startX = 160;
+    const startY = 60;
+    const tileSize = 60;
+
+    const isGoldenBoard = shopData.cosmeticsOwned['goldenboard'] && shopData.cosmeticsEnabled['goldenboard'];
+    const isDiamondBoard = shopData.cosmeticsOwned['diamondboard'] && shopData.cosmeticsEnabled['diamondboard'];
+
+    for (let r = 0; r < 8; r++) {
+        for (let c = 0; c < 8; c++) {
+            const x = startX + c * tileSize;
+            const y = startY + r * tileSize;
+
+            let lightColor = '#f1f5f9';
+            let darkColor = '#475569';
+
+            if (isGoldenBoard) {
+                lightColor = '#fef08a';
+                darkColor = '#ca8a04';
+            } else if (isDiamondBoard) {
+                lightColor = '#e0f2fe';
+                darkColor = '#0284c7';
+            }
+
+            ctx.fillStyle = (r + c) % 2 === 0 ? lightColor : darkColor;
+            ctx.fillRect(x, y, tileSize, tileSize);
+
+            if (selectedSquare && selectedSquare.r === r && selectedSquare.c === c) {
+                ctx.fillStyle = 'rgba(250, 204, 21, 0.5)';
+                ctx.fillRect(x, y, tileSize, tileSize);
+            }
+
+            const piece = board[r][c];
+            if (piece) {
+                ctx.font = '42px Arial';
+                ctx.textAlign = 'center';
+                ctx.fillStyle = piece[0] === 'w' ? '#ffffff' : '#0f172a';
+                ctx.strokeStyle = piece[0] === 'w' ? '#0f172a' : '#ffffff';
+                ctx.lineWidth = 1;
+                ctx.strokeText(PIECE_SYMBOLS[piece], x + tileSize / 2, y + 46);
+                ctx.fillText(PIECE_SYMBOLS[piece], x + tileSize / 2, y + 46);
+
+                // Two-layer outline: Chess Set outside, side color (white/black) inside.
+                // The inner side outline stays visible so you can immediately tell whose piece it is.
+                const pieceSet = boardSets[r][c] || 'crit';
+                const outlineColors = { pyro: '#f97316', vampire: '#22c55e', frost: '#00dfff', air: '#7dd3fc', soundwave: '#d2b48c', crit: '#eab308' };
+
+                // Outer Chess Set outline
+                ctx.strokeStyle = outlineColors[pieceSet] || '#eab308';
+                ctx.lineWidth = 4;
+                ctx.strokeText(PIECE_SYMBOLS[piece], x + tileSize / 2, y + 46);
+
+                // Inner side outline — black for White pieces, white for Black pieces
+                ctx.strokeStyle = piece[0] === 'w' ? '#0f172a' : '#ffffff';
+                ctx.lineWidth = 1.5;
+                ctx.strokeText(PIECE_SYMBOLS[piece], x + tileSize / 2, y + 46);
+
+                // Cosmetic Overlays
+                if (shopData.cosmeticsOwned['eyeballs'] && shopData.cosmeticsEnabled['eyeballs']) {
+                    ctx.fillStyle = '#ffffff';
+                    ctx.beginPath();
+                    ctx.arc(x + 22, y + 20, 4, 0, Math.PI*2);
+                    ctx.arc(x + 38, y + 20, 4, 0, Math.PI*2);
+                    ctx.fill();
+                    ctx.fillStyle = '#000000';
+                    ctx.beginPath();
+                    ctx.arc(x + 22, y + 20, 2, 0, Math.PI*2);
+                    ctx.arc(x + 38, y + 20, 2, 0, Math.PI*2);
+                    ctx.fill();
+                }
+
+                if (shopData.cosmeticsOwned['coolshadez'] && shopData.cosmeticsEnabled['coolshadez']) {
+                    ctx.fillStyle = '#000000';
+                    ctx.fillRect(x + 12, y + 18, 15, 7);
+                    ctx.fillRect(x + 33, y + 18, 15, 7);
+                    ctx.fillRect(x + 27, y + 20, 6, 3);
+                    ctx.fillStyle = '#334155';
+                    ctx.fillRect(x + 15, y + 20, 9, 3);
+                    ctx.fillRect(x + 36, y + 20, 9, 3);
+                }
+
+                if (shopData.cosmeticsOwned['fancy'] && shopData.cosmeticsEnabled['fancy']) {
+                    ctx.fillStyle = '#000000';
+                    ctx.fillRect(x + 10, y + 2, 40, 5);
+                    ctx.fillRect(x + 18, y - 10, 24, 12);
+                    ctx.fillStyle = '#334155';
+                    ctx.fillRect(x + 18, y - 1, 24, 3);
+                }
+            }
+        }
+    }
+
+    // Sneeze / Undo Button UI
+    const sneezes = shopData.sneezesCount || 0;
+    ctx.fillStyle = sneezes > 0 ? '#16a34a' : '#475569';
+    ctx.fillRect(660, 540, 120, 45);
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(660, 540, 120, 45);
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 14px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText(`🤧 SNEEZE`, 720, 560);
+    ctx.font = '11px Arial';
+    ctx.fillText(`(${sneezes} Left)`, 720, 576);
+}
+
+function drawArena() {
+    ctx.fillStyle = '#0f172a';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    ctx.fillStyle = '#64748b';
+    ctx.font = 'bold 14px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText(currentMapName, canvas.width / 2, 25);
+
+    platforms.forEach(p => {
+        ctx.fillStyle = p.isSolid ? '#334155' : '#475569';
+        ctx.fillRect(p.x, p.y, p.w, p.h);
+    });
+
+    vibrationFields.forEach(vf => {
+        ctx.fillStyle = 'rgba(210, 180, 140, 0.25)';
+        ctx.fillRect(vf.x, vf.y, vf.w, vf.h);
+        ctx.strokeStyle = '#d2b48c';
+        ctx.strokeRect(vf.x, vf.y, vf.w, vf.h);
+    });
+
+    p1.draw();
+    p2.draw();
+
+    projectiles.forEach(p => {
+        ctx.fillStyle = p.color;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.radius, 0, Math.PI * 2);
+        ctx.fill();
+    });
+
+    beams.forEach(b => {
+        ctx.fillStyle = b.color;
+        ctx.fillRect(b.x, b.y, b.w, b.h);
+    });
+
+    floatTexts.forEach(ft => {
+        ctx.fillStyle = ft.color;
+        ctx.font = 'bold 14px Arial';
+        ctx.fillText(ft.text, ft.x, ft.y);
+    });
+
+    // Health Bars
+    ctx.fillStyle = '#1e293b';
+    ctx.fillRect(50, 40, 250, 20);
+    ctx.fillStyle = '#38bdf8';
+    ctx.fillRect(50, 40, (p1.hp / 100) * 250, 20);
+    ctx.strokeStyle = '#ffffff';
+    ctx.strokeRect(50, 40, 250, 20);
+
+    ctx.fillStyle = '#1e293b';
+    ctx.fillRect(500, 40, 250, 20);
+    ctx.fillStyle = '#f43f5e';
+    ctx.fillRect(500, 40, (p2.hp / 100) * 250, 20);
+    ctx.strokeStyle = '#ffffff';
+    ctx.strokeRect(500, 40, 250, 20);
+}
+
+function drawVictory() {
+    ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    ctx.fillStyle = '#facc15';
+    ctx.font = 'bold 48px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText('🏆 VICTORY! 🏆', canvas.width / 2, 220);
+
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 28px Arial';
+    ctx.fillText(`${gameWinner} WINS THE MATCH!`, canvas.width / 2, 280);
+
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '16px Arial';
+    ctx.fillText('Press SPACE or ENTER to return to Main Menu', canvas.width / 2, 380);
+}
+
+function drawPopups() {
+    if (achievementPopup) {
+        ctx.fillStyle = '#1e293b';
+        ctx.fillRect(540, 20, 240, 60);
+        ctx.strokeStyle = '#eab308';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(540, 20, 240, 60);
+
+        ctx.fillStyle = '#eab308';
+        ctx.font = 'bold 12px Arial';
+        ctx.textAlign = 'left';
+        ctx.fillText('🏆 ACHIEVEMENT UNLOCKED!', 550, 38);
+
+        ctx.fillStyle = '#ffffff';
+        ctx.font = 'bold 14px Arial';
+        ctx.fillText(achievementPopup.title, 550, 58);
+
+        achievementPopup.timer--;
+        if (achievementPopup.timer <= 0) achievementPopup = null;
+    }
+
+    if (centerPopup) {
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.8)';
+        ctx.fillRect(200, 250, 400, 80);
+        ctx.strokeStyle = '#f43f5e';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(200, 250, 400, 80);
+
+        ctx.fillStyle = '#f43f5e';
+        ctx.font = 'bold 20px Arial';
+        ctx.textAlign = 'center';
+        ctx.fillText(centerPopup.text, 400, 298);
+
+        centerPopup.timer--;
+        if (centerPopup.timer <= 0) centerPopup = null;
+    }
+}
+
+function gameLoop() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    if (gameState === STATE_MENU) drawMenu();
+    else if (gameState === STATE_SHOP) drawShop();
+    else if (gameState === STATE_SETUP) drawSetup();
+    else if (gameState === STATE_CUSTOM_SETUP) drawCustomSetup();
+    else if (gameState === STATE_SETTINGS) drawSettings();
+    else if (gameState === STATE_STATS) drawStats();
+    else if (gameState === STATE_LOG) drawLog();
+    else if (gameState === STATE_CHESS) {
+        updateChessBot();
+        drawChess();
+    } else if (gameState === STATE_ARENA) {
+        updateArena();
+        drawArena();
+    } else if (gameState === STATE_VICTORY) {
+        drawChess();
+        drawVictory();
+    }
+
+    drawPopups();
+    requestAnimationFrame(gameLoop);
+}
+
+gameLoop();
+</script>
+</body>
+</html>
